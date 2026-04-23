@@ -242,6 +242,58 @@ def _extract_pages_pymupdf(doc: fitz.Document) -> str:
     return "\n\n".join(page.get_text() for page in doc)
 
 
+def _classify_page(page: fitz.Page) -> tuple[bool, str, dict]:
+    """
+    Classify a single PDF page as digital or scanned using the same 4-signal
+    vote as the document-level classifier.
+
+    Uses page.get_text("blocks") in one call to derive both the plain text
+    content and the text-block count, avoiding a second page read.
+
+    Returns
+    -------
+    is_digital : bool
+    text       : str   – extracted text (only meaningful when is_digital=True)
+    signals    : dict  – per-signal values and vote breakdown
+    """
+    raw_blocks = page.get_text("blocks")
+    text_blocks = [b for b in raw_blocks if len(b) > 6 and b[6] == 0]
+    plain_text = "\n".join(b[4] for b in text_blocks)
+    char_count = len(plain_text.strip())
+    text_block_count = len(text_blocks)
+
+    has_fonts = bool(page.get_fonts())
+
+    page_area = page.rect.width * page.rect.height
+    img_ratio = 0.0
+    if page_area > 0:
+        img_area = 0.0
+        for info in page.get_image_info():
+            bbox = info.get("bbox", (0, 0, 0, 0))
+            img_area += abs((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+        img_ratio = min(img_area / page_area, 1.0)
+
+    sig_chars  = char_count       >= MIN_TEXT_DENSITY
+    sig_fonts  = has_fonts
+    sig_images = img_ratio        <  MAX_SCANNED_IMAGE_RATIO
+    sig_blocks = text_block_count >= MIN_TEXT_BLOCK_DENSITY
+
+    votes = sum([sig_chars, sig_fonts, sig_images, sig_blocks])
+    is_digital = votes >= CLASSIFICATION_VOTES_NEEDED
+
+    return is_digital, plain_text, {
+        "char_count":       char_count,
+        "char_density_ok":  sig_chars,
+        "has_fonts":        has_fonts,
+        "fonts_ok":         sig_fonts,
+        "image_area_ratio": round(img_ratio, 3),
+        "image_ratio_ok":   sig_images,
+        "text_block_count": text_block_count,
+        "text_blocks_ok":   sig_blocks,
+        "digital_votes":    votes,
+    }
+
+
 def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
     """
     Extract text from scanned PDF using Surya OCR.
@@ -273,34 +325,85 @@ def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]:
     """
-    Classify the PDF with a multi-signal heuristic, then extract text.
+    Extract text from a PDF using a per-page digital/scanned decision.
 
-    Opens the document once for classification; reuses the open handle for
-    PyMuPDF extraction so digital PDFs are never opened twice.
+    Each page is independently classified with the 4-signal vote.  Digital
+    pages are read via PyMuPDF; scanned pages are rendered to images and
+    collected for a single batched Surya OCR call.  Mixed documents (some
+    digital, some scanned) are handled correctly without skipping any page.
 
-    Returns (text, extraction_method, page_count, extraction_time_s, classification).
+    Returns
+    -------
+    text              : str   – full document text, pages joined by double newline
+    extraction_method : str   – 'pymupdf' | 'surya_ocr' | 'mixed'
+    page_count        : int
+    extraction_time_s : float
+    classification    : dict  – per-page modes, signals, and document-level summary
     """
     t0 = time.perf_counter()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_count = len(doc)
 
-    classification = _classify_pdf_nature(doc)
-    logger.info(
-        "PDF classification: is_digital=%s votes=%d/4 confidence=%s | %s",
-        classification["is_digital"],
-        classification["digital_votes"],
-        classification["confidence"],
-        classification["signals"],
-    )
+    page_texts: list[str]             = [""] * page_count
+    page_modes: list[str]             = []
+    page_signals: list[dict]          = []
+    scanned_indices: list[int]        = []
+    scanned_images: list[Image.Image] = []
 
-    if classification["is_digital"]:
-        text = _extract_pages_pymupdf(doc)
-        doc.close()
-        return text, "pymupdf", page_count, round(time.perf_counter() - t0, 4), classification
+    for i, page in enumerate(doc):
+        is_digital, text, signals = _classify_page(page)
+        page_signals.append({"page": i + 1, **signals})
+
+        if is_digital:
+            page_texts[i] = text
+            page_modes.append("pymupdf")
+        else:
+            pix = page.get_pixmap(dpi=150)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            scanned_indices.append(i)
+            scanned_images.append(img)
+            page_modes.append("surya_ocr")
+            logger.debug(
+                "Page %d/%d → OCR (votes=%d/4)", i + 1, page_count, signals["digital_votes"]
+            )
 
     doc.close()
-    text, page_count = extract_text_surya(pdf_bytes)
-    return text, "surya_ocr", page_count, round(time.perf_counter() - t0, 4), classification
+
+    # All scanned pages go through a single model call for efficiency
+    if scanned_images:
+        from surya.ocr import run_ocr
+        model, processor = get_surya_models()
+        logger.info(
+            "Running Surya OCR on %d/%d scanned page(s)", len(scanned_images), page_count
+        )
+        ocr_results = run_ocr(scanned_images, model, processor)
+        for idx, result in zip(scanned_indices, ocr_results):
+            page_texts[idx] = "\n".join(line.text for line in result.text_lines)
+
+    n_scanned = len(scanned_indices)
+    n_digital = page_count - n_scanned
+
+    if n_scanned == 0:
+        method = "pymupdf"
+    elif n_digital == 0:
+        method = "surya_ocr"
+    else:
+        method = "mixed"
+
+    logger.info(
+        "Extraction complete: method=%s digital_pages=%d scanned_pages=%d",
+        method, n_digital, n_scanned,
+    )
+
+    classification = {
+        "is_mixed":           0 < n_scanned < page_count,
+        "digital_page_count": n_digital,
+        "scanned_page_count": n_scanned,
+        "page_modes":         page_modes,
+        "page_signals":       page_signals,
+    }
+
+    return "\n\n".join(page_texts), method, page_count, round(time.perf_counter() - t0, 4), classification
 
 
 # ---------------------------------------------------------------------------
