@@ -11,6 +11,7 @@ FastAPI server that:
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -25,6 +26,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+
+# BM25 retrieval — optional dependency; falls back to positional selection if absent
+try:
+    from rank_bm25 import BM25Okapi as _BM25Okapi
+    _BM25_AVAILABLE = True
+except ImportError:
+    _BM25Okapi = None   # type: ignore[assignment,misc]
+    _BM25_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,6 +53,17 @@ OCR_RENDER_DPI           = 200   # base render resolution (higher → better OCR
 OCR_CONFIDENCE_THRESHOLD = 0.70  # avg line-confidence below this → attempt second pass
 OCR_SECOND_PASS_DPI      = 300   # re-render resolution for low-confidence pages
 OCR_MIN_LINES_FOR_QUALITY = 3    # minimum lines needed for a meaningful confidence signal
+
+# --- Context / token budget ---
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "6000"))
+CHARS_PER_TOKEN    = 4           # rough approximation (1 token ≈ 4 chars)
+MAX_CONTEXT_CHARS  = MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN  # 24 000 chars
+MAX_CHUNK_CHARS    = 1500        # max chars per individual chunk (~375 tokens)
+
+# --- BM25 retrieval ---
+# Retrieve this many top-scored chunks; the budget cap then selects how many fit.
+# Setting it higher than needed is fine — budget is the hard limit.
+BM25_TOP_K = int(os.getenv("BM25_TOP_K", "30"))
 
 METRICS_LOG_PATH = Path(os.getenv("METRICS_LOG", "metrics.jsonl"))
 
@@ -510,9 +530,177 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
         "page_modes":         page_modes,
         "page_signals":       page_signals,
         "ocr_quality":        ocr_quality,
+        # page_texts is popped in the endpoint before metrics logging to avoid
+        # storing large text blobs in the JSONL record
+        "_page_texts":        page_texts,
     }
 
     return "\n\n".join(page_texts), method, page_count, round(time.perf_counter() - t0, 4), classification
+
+
+# ---------------------------------------------------------------------------
+# Document chunking + context budget
+# ---------------------------------------------------------------------------
+
+def _split_page_into_chunks(page_text: str, page_num: int, max_chars: int) -> list[dict]:
+    """
+    Split one page's text into sub-chunks of at most max_chars.
+    Breaks prefer double-newlines (paragraphs) then single newlines.
+    Each chunk carries page number and part index for labelling in the prompt.
+    """
+    text = page_text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [{"page": page_num, "part": 1, "text": text, "char_count": len(text)}]
+
+    parts: list[dict] = []
+    remaining = text
+    part = 1
+    while remaining:
+        if len(remaining) <= max_chars:
+            parts.append({"page": page_num, "part": part, "text": remaining, "char_count": len(remaining)})
+            break
+        cut = max_chars
+        # Try paragraph break first, then line break
+        b = remaining.rfind("\n\n", 0, cut)
+        if b > max_chars // 3:
+            cut = b
+        else:
+            b = remaining.rfind("\n", 0, cut)
+            if b > max_chars // 3:
+                cut = b
+        chunk_text = remaining[:cut].rstrip()
+        if chunk_text:
+            parts.append({"page": page_num, "part": part, "text": chunk_text, "char_count": len(chunk_text)})
+        remaining = remaining[cut:].lstrip()
+        part += 1
+    return parts
+
+
+def chunk_document(page_texts: list[str]) -> list[dict]:
+    """
+    Convert a list of per-page texts into a flat list of chunks.
+    Long pages are split into multiple parts via _split_page_into_chunks.
+    Each chunk: {"page": int, "part": int, "text": str, "char_count": int}.
+    """
+    chunks: list[dict] = []
+    for i, page_text in enumerate(page_texts):
+        chunks.extend(_split_page_into_chunks(page_text, page_num=i + 1, max_chars=MAX_CHUNK_CHARS))
+    return chunks
+
+
+def select_chunks_within_budget(
+    chunks: list[dict],
+    max_chars: int = MAX_CONTEXT_CHARS,
+) -> tuple[list[dict], dict]:
+    """
+    Greedily select chunks from the start until the character budget is exhausted.
+    Returns (selected_chunks, budget_info).
+
+    This is a positional fallback.  Item 5 replaces the selection logic with
+    relevance-ranked retrieval while keeping this function's signature intact.
+    """
+    selected: list[dict] = []
+    total_chars = 0
+    for chunk in chunks:
+        if total_chars + chunk["char_count"] > max_chars:
+            break
+        selected.append(chunk)
+        total_chars += chunk["char_count"]
+
+    total_pages = chunks[-1]["page"] if chunks else 0
+    last_selected_page = selected[-1]["page"] if selected else 0
+    was_truncated = len(selected) < len(chunks)
+
+    return selected, {
+        "total_chunks":              len(chunks),
+        "selected_chunks":           len(selected),
+        "was_truncated":             was_truncated,
+        "context_chars":             total_chars,
+        "estimated_context_tokens":  total_chars // CHARS_PER_TOKEN,
+        "max_context_tokens":        MAX_CONTEXT_TOKENS,
+        "pages_in_context":          f"1–{last_selected_page}" if was_truncated else f"1–{total_pages}",
+        "pages_omitted":             total_pages - last_selected_page if was_truncated else 0,
+    }
+
+
+def _tokenize_for_bm25(text: str) -> list[str]:
+    """
+    Lowercase, strip punctuation, split on whitespace.
+    Used for both the corpus (chunks) and the query (question) so they share
+    the same vocabulary and match on stems like 'total' == 'total:'.
+    """
+    return re.sub(r"[^a-z0-9\s]", " ", text.lower()).split()
+
+
+def retrieve_relevant_chunks(
+    question: str,
+    chunks: list[dict],
+    top_k: int = BM25_TOP_K,
+) -> tuple[list[dict], dict]:
+    """
+    Rank all chunks by BM25 relevance to the question, return the top_k.
+
+    BM25 (Okapi BM25) is a bag-of-words ranking function that weighs term
+    frequency against inverse document frequency.  It finds chunks that share
+    keywords with the question, naturally surfacing the pages most likely to
+    contain the answer — regardless of where they sit in the document.
+
+    Falls back to positional order if rank_bm25 is not installed.
+
+    Returns (ranked_chunks, retrieval_info).
+    Chunks are in RELEVANCE order (highest score first).
+    The caller must re-sort by page number before formatting the prompt.
+    """
+    if not chunks:
+        return [], {"method": "none", "reason": "no chunks", "retrieved": 0}
+
+    if not _BM25_AVAILABLE:
+        logger.warning(
+            "rank_bm25 not installed — falling back to positional chunk selection. "
+            "Install with: pip install rank-bm25"
+        )
+        fallback = chunks[:top_k]
+        return fallback, {
+            "method":       "positional_fallback",
+            "reason":       "rank_bm25 not installed",
+            "top_k":        top_k,
+            "total_chunks": len(chunks),
+            "retrieved":    len(fallback),
+        }
+
+    tokenized_corpus = [_tokenize_for_bm25(c["text"]) for c in chunks]
+    bm25 = _BM25Okapi(tokenized_corpus)
+
+    query_tokens = _tokenize_for_bm25(question)
+    scores = bm25.get_scores(query_tokens)
+
+    # Sort by score descending, take top_k
+    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+    ranked = [{"bm25_score": round(float(scores[i]), 4), **chunks[i]} for i in ranked_indices]
+
+    return ranked, {
+        "method":      "bm25",
+        "top_k":       top_k,
+        "total_chunks": len(chunks),
+        "retrieved":   len(ranked),
+        "top_score":   round(float(scores[ranked_indices[0]]), 4) if ranked_indices else 0.0,
+        "min_score":   round(float(scores[ranked_indices[-1]]), 4) if ranked_indices else 0.0,
+    }
+
+
+def format_chunks_for_prompt(chunks: list[dict]) -> str:
+    """
+    Render selected chunks as a labelled string ready for the prompt.
+    Single-part pages get a plain [Page N] header; sub-chunked pages get [Page N, Part M].
+    """
+    parts: list[str] = []
+    for chunk in chunks:
+        page, part = chunk["page"], chunk.get("part", 1)
+        label = f"[Page {page}]" if part == 1 else f"[Page {page}, Part {part}]"
+        parts.append(f"{label}\n{chunk['text']}")
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +838,44 @@ async def analyze_pdf(
             detail="No text could be extracted from the PDF",
         )
 
-    messages = build_prompt(document_text, question)
+    # --- Chunking → BM25 retrieval → context budget ---
+    # Pop page_texts before metrics logging (avoid storing large blobs in JSONL)
+    page_texts_list: list[str] = pdf_classification.pop("_page_texts", [document_text])
+
+    chunks = chunk_document(page_texts_list)
+
+    # Rank all chunks by relevance to the question
+    ranked_chunks, retrieval_info = retrieve_relevant_chunks(question, chunks)
+
+    # Apply token budget — now fills with the most relevant chunks first
+    selected_chunks, budget_info = select_chunks_within_budget(ranked_chunks)
+
+    # Re-sort selected chunks into document (page) order so the context reads
+    # coherently: the model sees page 3 before page 24, not relevance order
+    selected_chunks_ordered = sorted(
+        selected_chunks, key=lambda c: (c["page"], c.get("part", 1))
+    )
+
+    if budget_info["was_truncated"]:
+        logger.info(
+            "[req=%s] BM25 retrieved %d/%d chunks; %d fit budget (%s of %d pages). "
+            "Low-relevance chunks omitted.",
+            request_id,
+            retrieval_info["retrieved"],
+            retrieval_info["total_chunks"],
+            budget_info["selected_chunks"],
+            budget_info["pages_in_context"],
+            page_count,
+        )
+    else:
+        logger.info(
+            "[req=%s] BM25 retrieved %d relevant chunks — all fit budget.",
+            request_id,
+            retrieval_info["retrieved"],
+        )
+
+    context_text = format_chunks_for_prompt(selected_chunks_ordered)
+    messages = build_prompt(context_text, question)
 
     # Estimate prompt size (rough: 1 token ≈ 4 chars)
     prompt_chars = sum(len(m["content"]) for m in messages)
@@ -689,6 +914,8 @@ async def analyze_pdf(
                 "question_words": len(question.split()),
                 "total_prompt_chars": prompt_chars,
                 "estimated_prompt_tokens": est_prompt_tokens,
+                "retrieval": retrieval_info,
+                "context_budget": budget_info,
             },
             "model": {
                 "id": _active_model,
