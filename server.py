@@ -31,7 +31,14 @@ from starlette.requests import Request
 # ---------------------------------------------------------------------------
 
 SGLANG_URL = os.getenv("SGLANG_URL", "http://localhost:30000")
-MIN_TEXT_DENSITY = 50  # minimum chars/page to consider PDF as "has text"
+
+# --- PDF classification thresholds (multi-signal) ---
+MIN_TEXT_DENSITY = 50           # avg chars/page: below → no meaningful text
+MIN_DIGITAL_FONT_RATIO = 0.5   # fraction of pages that must carry embedded fonts
+MAX_SCANNED_IMAGE_RATIO = 0.6  # avg image-area/page-area: above → full-page scan image
+MIN_TEXT_BLOCK_DENSITY = 2.0   # avg text blocks/page: below → no structural text
+CLASSIFICATION_VOTES_NEEDED = 3 # signals (out of 4) required to call a PDF "digital"
+
 METRICS_LOG_PATH = Path(os.getenv("METRICS_LOG", "metrics.jsonl"))
 
 # ---------------------------------------------------------------------------
@@ -145,28 +152,94 @@ def get_surya_models():
 # PDF extraction
 # ---------------------------------------------------------------------------
 
-def extract_text_pymupdf(pdf_bytes: bytes) -> tuple[str, bool, int]:
+def _classify_pdf_nature(doc: fitz.Document) -> dict:
     """
-    Extract text from PDF using PyMuPDF.
-    Returns (text, has_sufficient_text, page_count).
+    Multi-signal heuristic that decides whether a PDF is digital or scanned.
+
+    Four independent signals are each voted as digital (1) or scanned (0).
+    A final majority vote (CLASSIFICATION_VOTES_NEEDED of 4) gives the verdict.
+
+    Signals
+    -------
+    1. char_density   – avg extracted chars/page  (low → no selectable text)
+    2. font_ratio     – fraction of pages with embedded fonts (absent → raster scan)
+    3. image_ratio    – avg image area / page area (high → full-page scan background)
+    4. text_blocks    – avg PyMuPDF text-block count/page (near-zero → no structure)
+
+    Returns a dict with 'is_digital', 'digital_votes', 'confidence', and 'signals'.
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages_text = []
+    page_count = len(doc)
+    if page_count == 0:
+        return {"is_digital": False, "digital_votes": 0, "confidence": "low", "signals": {}}
+
     total_chars = 0
+    pages_with_fonts = 0
+    total_image_ratio = 0.0
+    total_text_blocks = 0
 
     for page in doc:
+        # Signal 1 — character count from selectable text layer
         text = page.get_text()
-        pages_text.append(text)
         total_chars += len(text.strip())
 
-    page_count = len(pages_text)
-    doc.close()
+        # Signal 2 — embedded font presence
+        if page.get_fonts():
+            pages_with_fonts += 1
 
-    full_text = "\n\n".join(pages_text)
-    avg_chars_per_page = total_chars / max(page_count, 1)
-    has_sufficient_text = avg_chars_per_page >= MIN_TEXT_DENSITY
+        # Signal 3 — image area coverage
+        page_area = page.rect.width * page.rect.height
+        if page_area > 0:
+            img_area = 0.0
+            for info in page.get_image_info():
+                bbox = info.get("bbox", (0, 0, 0, 0))
+                img_area += abs((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+            total_image_ratio += min(img_area / page_area, 1.0)
 
-    return full_text, has_sufficient_text, page_count
+        # Signal 4 — text block count (block_type 0 = text, 1 = image)
+        blocks = page.get_text("blocks")
+        total_text_blocks += sum(1 for b in blocks if len(b) > 6 and b[6] == 0)
+
+    avg_chars = total_chars / page_count
+    font_page_ratio = pages_with_fonts / page_count
+    avg_image_ratio = total_image_ratio / page_count
+    avg_text_blocks = total_text_blocks / page_count
+
+    sig_chars = avg_chars >= MIN_TEXT_DENSITY
+    sig_fonts = font_page_ratio >= MIN_DIGITAL_FONT_RATIO
+    sig_images = avg_image_ratio < MAX_SCANNED_IMAGE_RATIO
+    sig_blocks = avg_text_blocks >= MIN_TEXT_BLOCK_DENSITY
+
+    digital_votes = sum([sig_chars, sig_fonts, sig_images, sig_blocks])
+    is_digital = digital_votes >= CLASSIFICATION_VOTES_NEEDED
+
+    # 4/4 or 0/4 → high confidence; 3/4 or 1/4 → medium; 2/4 → ambiguous
+    if digital_votes in (0, 4):
+        confidence = "high"
+    elif digital_votes in (1, 3):
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "is_digital": is_digital,
+        "digital_votes": digital_votes,
+        "confidence": confidence,
+        "signals": {
+            "avg_chars_per_page": round(avg_chars, 1),
+            "char_density_ok": sig_chars,
+            "font_page_ratio": round(font_page_ratio, 3),
+            "fonts_ok": sig_fonts,
+            "avg_image_area_ratio": round(avg_image_ratio, 3),
+            "image_ratio_ok": sig_images,
+            "avg_text_blocks_per_page": round(avg_text_blocks, 1),
+            "text_blocks_ok": sig_blocks,
+        },
+    }
+
+
+def _extract_pages_pymupdf(doc: fitz.Document) -> str:
+    """Return concatenated page text from an already-open PyMuPDF document."""
+    return "\n\n".join(page.get_text() for page in doc)
 
 
 def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
@@ -198,19 +271,36 @@ def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
     return "\n\n".join(pages_text), page_count
 
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float]:
+def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]:
     """
-    Extract text from PDF, preferring PyMuPDF and falling back to Surya OCR.
-    Returns (text, extraction_method, page_count, extraction_time_s).
+    Classify the PDF with a multi-signal heuristic, then extract text.
+
+    Opens the document once for classification; reuses the open handle for
+    PyMuPDF extraction so digital PDFs are never opened twice.
+
+    Returns (text, extraction_method, page_count, extraction_time_s, classification).
     """
     t0 = time.perf_counter()
-    text, has_text, page_count = extract_text_pymupdf(pdf_bytes)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_count = len(doc)
 
-    if has_text:
-        return text, "pymupdf", page_count, round(time.perf_counter() - t0, 4)
+    classification = _classify_pdf_nature(doc)
+    logger.info(
+        "PDF classification: is_digital=%s votes=%d/4 confidence=%s | %s",
+        classification["is_digital"],
+        classification["digital_votes"],
+        classification["confidence"],
+        classification["signals"],
+    )
 
+    if classification["is_digital"]:
+        text = _extract_pages_pymupdf(doc)
+        doc.close()
+        return text, "pymupdf", page_count, round(time.perf_counter() - t0, 4), classification
+
+    doc.close()
     text, page_count = extract_text_surya(pdf_bytes)
-    return text, "surya_ocr", page_count, round(time.perf_counter() - t0, 4)
+    return text, "surya_ocr", page_count, round(time.perf_counter() - t0, 4), classification
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +426,7 @@ async def analyze_pdf(
         raise HTTPException(status_code=400, detail="Empty file uploaded")
 
     try:
-        document_text, extraction_method, page_count, extraction_time_s = (
+        document_text, extraction_method, page_count, extraction_time_s, pdf_classification = (
             extract_text_from_pdf(pdf_bytes)
         )
     except Exception as e:
@@ -380,6 +470,7 @@ async def analyze_pdf(
                 "extraction_method": extraction_method,
                 "extraction_time_s": extraction_time_s,
                 "text_chars": len(document_text),
+                "classification": pdf_classification,
             },
             "prompt": {
                 "question": question,
