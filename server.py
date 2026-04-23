@@ -39,6 +39,12 @@ MAX_SCANNED_IMAGE_RATIO = 0.6  # avg image-area/page-area: above → full-page s
 MIN_TEXT_BLOCK_DENSITY = 2.0   # avg text blocks/page: below → no structural text
 CLASSIFICATION_VOTES_NEEDED = 3 # signals (out of 4) required to call a PDF "digital"
 
+# --- OCR quality settings ---
+OCR_RENDER_DPI           = 200   # base render resolution (higher → better OCR, more RAM)
+OCR_CONFIDENCE_THRESHOLD = 0.70  # avg line-confidence below this → attempt second pass
+OCR_SECOND_PASS_DPI      = 300   # re-render resolution for low-confidence pages
+OCR_MIN_LINES_FOR_QUALITY = 3    # minimum lines needed for a meaningful confidence signal
+
 METRICS_LOG_PATH = Path(os.getenv("METRICS_LOG", "metrics.jsonl"))
 
 # ---------------------------------------------------------------------------
@@ -146,6 +152,24 @@ def get_surya_models():
         _surya_model = load_model()
         _surya_processor = load_processor()
     return _surya_model, _surya_processor
+
+
+def _score_ocr_result(page_result) -> tuple[float, int]:
+    """
+    Compute average confidence and line count from a Surya OCR page result.
+
+    Surya's TextLine objects carry a `confidence` float in [0, 1].
+    We use getattr with a safe default so the function stays compatible with
+    future Surya versions that might rename the field.
+
+    Returns (avg_confidence, line_count).
+    avg_confidence is 0.0 when there are no lines (blank / failed page).
+    """
+    lines = getattr(page_result, "text_lines", [])
+    if not lines:
+        return 0.0, 0
+    confidences = [getattr(line, "confidence", 1.0) for line in lines]
+    return sum(confidences) / len(confidences), len(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +330,7 @@ def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
 
     images = []
     for page in doc:
-        pix = page.get_pixmap(dpi=150)
+        pix = page.get_pixmap(dpi=OCR_RENDER_DPI)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         images.append(img)
 
@@ -358,7 +382,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
             page_texts[i] = text
             page_modes.append("pymupdf")
         else:
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=OCR_RENDER_DPI)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             scanned_indices.append(i)
             scanned_images.append(img)
@@ -369,16 +393,82 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
 
     doc.close()
 
-    # All scanned pages go through a single model call for efficiency
+    # Track which doc-page indices needed a second pass (used for classification summary)
+    low_conf_page_indices: list[int] = []
+
+    # All scanned pages go through a single batched model call
     if scanned_images:
         from surya.ocr import run_ocr
         model, processor = get_surya_models()
         logger.info(
-            "Running Surya OCR on %d/%d scanned page(s)", len(scanned_images), page_count
+            "OCR pass 1 at %d DPI on %d/%d scanned page(s)",
+            OCR_RENDER_DPI, len(scanned_images), page_count,
         )
-        ocr_results = run_ocr(scanned_images, model, processor)
-        for idx, result in zip(scanned_indices, ocr_results):
-            page_texts[idx] = "\n".join(line.text for line in result.text_lines)
+        first_pass_results = run_ocr(scanned_images, model, processor)
+
+        # Assess quality; store first-pass text and confidence flags
+        second_pass_doc_indices: list[int]   = []  # doc-page indices needing retry
+        second_pass_images:      list[Image.Image] = []
+
+        for local_i, (doc_idx, result) in enumerate(zip(scanned_indices, first_pass_results)):
+            avg_conf, line_count = _score_ocr_result(result)
+            needs_second_pass = (
+                line_count >= OCR_MIN_LINES_FOR_QUALITY
+                and avg_conf < OCR_CONFIDENCE_THRESHOLD
+            )
+            page_texts[doc_idx] = "\n".join(
+                line.text for line in getattr(result, "text_lines", [])
+            )
+            page_signals[doc_idx].update({
+                "ocr_avg_confidence":    round(avg_conf, 4),
+                "ocr_line_count":        line_count,
+                "ocr_low_confidence":    needs_second_pass,
+                "ocr_second_pass_used":  False,
+            })
+            if needs_second_pass:
+                second_pass_doc_indices.append(doc_idx)
+
+        # Second pass: re-render only the low-confidence pages at higher DPI
+        if second_pass_doc_indices:
+            logger.info(
+                "OCR pass 2 at %d DPI for %d low-confidence page(s): %s",
+                OCR_SECOND_PASS_DPI,
+                len(second_pass_doc_indices),
+                [p + 1 for p in second_pass_doc_indices],
+            )
+            doc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for doc_idx in second_pass_doc_indices:
+                pix = doc2[doc_idx].get_pixmap(dpi=OCR_SECOND_PASS_DPI)
+                second_pass_images.append(
+                    Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                )
+            doc2.close()
+
+            second_pass_results = run_ocr(second_pass_images, model, processor)
+
+            for doc_idx, result in zip(second_pass_doc_indices, second_pass_results):
+                avg_conf2, line_count2 = _score_ocr_result(result)
+                prev_conf = page_signals[doc_idx]["ocr_avg_confidence"]
+                if avg_conf2 > prev_conf:
+                    page_texts[doc_idx] = "\n".join(
+                        line.text for line in getattr(result, "text_lines", [])
+                    )
+                    page_signals[doc_idx].update({
+                        "ocr_avg_confidence":   round(avg_conf2, 4),
+                        "ocr_line_count":       line_count2,
+                        "ocr_second_pass_used": True,
+                    })
+                    logger.debug(
+                        "Page %d: pass 2 improved confidence %.3f → %.3f",
+                        doc_idx + 1, prev_conf, avg_conf2,
+                    )
+                else:
+                    logger.debug(
+                        "Page %d: pass 2 no improvement (%.3f vs %.3f), keeping pass 1",
+                        doc_idx + 1, avg_conf2, prev_conf,
+                    )
+
+            low_conf_page_indices = second_pass_doc_indices
 
     n_scanned = len(scanned_indices)
     n_digital = page_count - n_scanned
@@ -395,12 +485,31 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
         method, n_digital, n_scanned,
     )
 
+    # Build OCR quality summary (only meaningful when scanned pages exist)
+    ocr_quality: dict = {}
+    if n_scanned > 0:
+        ocr_sigs = [ps for ps in page_signals if "ocr_avg_confidence" in ps]
+        overall_conf = (
+            round(sum(ps["ocr_avg_confidence"] for ps in ocr_sigs) / len(ocr_sigs), 4)
+            if ocr_sigs else None
+        )
+        ocr_quality = {
+            "render_dpi":              OCR_RENDER_DPI,
+            "confidence_threshold":    OCR_CONFIDENCE_THRESHOLD,
+            "overall_avg_confidence":  overall_conf,
+            "low_confidence_pages":    [p + 1 for p in low_conf_page_indices],
+            "second_pass_page_count":  sum(
+                1 for ps in page_signals if ps.get("ocr_second_pass_used")
+            ),
+        }
+
     classification = {
         "is_mixed":           0 < n_scanned < page_count,
         "digital_page_count": n_digital,
         "scanned_page_count": n_scanned,
         "page_modes":         page_modes,
         "page_signals":       page_signals,
+        "ocr_quality":        ocr_quality,
     }
 
     return "\n\n".join(page_texts), method, page_count, round(time.perf_counter() - t0, 4), classification
