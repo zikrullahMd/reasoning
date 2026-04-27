@@ -118,5 +118,8 @@ echo ""
 echo "Press Ctrl+C to stop"
 echo ""
 
+# Force Surya OCR to run on CPU so it doesn't compete with SGLang for GPU VRAM.
+export TORCH_DEVICE="${TORCH_DEVICE:-cpu}"
+
 export SGLANG_URL="http://localhost:${SGLANG_PORT}"
 exec uvicorn server:app --host 0.0.0.0 --port $FASTAPI_PORT

@@ -54,6 +54,13 @@ OCR_CONFIDENCE_THRESHOLD = 0.70  # avg line-confidence below this → attempt se
 OCR_SECOND_PASS_DPI      = 300   # re-render resolution for low-confidence pages
 OCR_MIN_LINES_FOR_QUALITY = 3    # minimum lines needed for a meaningful confidence signal
 
+# --- Post-extraction quality gate ---
+# A digital page that yields fewer chars than this per point² of page area is
+# considered "thin" — PyMuPDF extracted something but not enough to be useful.
+# The page is silently re-routed to OCR regardless of the classification vote.
+# A4 ≈ 501 000 pt² → threshold ≈ 150 chars minimum on a full page.
+MIN_CHARS_PER_SQPT = float(os.getenv("MIN_CHARS_PER_SQPT", "0.0003"))
+
 # --- Context / token budget ---
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "6000"))
 CHARS_PER_TOKEN    = 4           # rough approximation (1 token ≈ 4 chars)
@@ -64,6 +71,17 @@ MAX_CHUNK_CHARS    = 1500        # max chars per individual chunk (~375 tokens)
 # Retrieve this many top-scored chunks; the budget cap then selects how many fit.
 # Setting it higher than needed is fine — budget is the hard limit.
 BM25_TOP_K = int(os.getenv("BM25_TOP_K", "30"))
+
+# --- LLM behaviour (item 7) ---
+# Low temperature (0.0–0.15) keeps the model grounded on document text.
+# 0.7 is creative writing; 0.1 is precise extraction.
+LLM_TEMPERATURE   = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "2048"))
+
+# --- Dynamic token budget (item 9) ---
+# Total practical context window to target.  Document budget is computed
+# per-request as: total - system_prompt - question - output_reserve.
+MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "8000"))
 
 METRICS_LOG_PATH = Path(os.getenv("METRICS_LOG", "metrics.jsonl"))
 
@@ -82,8 +100,9 @@ perf_logger = logging.getLogger("perf")
 # Surya OCR lazy state + active model cache
 # ---------------------------------------------------------------------------
 
-_surya_model = None
-_surya_processor = None
+_surya_foundation_predictor = None  # surya.foundation.FoundationPredictor
+_surya_rec_predictor = None         # surya.recognition.RecognitionPredictor
+_surya_det_predictor = None         # surya.detection.DetectionPredictor
 _active_model: str = "unknown"
 
 
@@ -164,14 +183,26 @@ app.add_middleware(TimingMiddleware)
 # Surya OCR
 # ---------------------------------------------------------------------------
 
-def get_surya_models():
-    """Lazy-load Surya OCR models (keeps GPU free until needed)."""
-    global _surya_model, _surya_processor
-    if _surya_model is None:
-        from surya.ocr import load_model, load_processor
-        _surya_model = load_model()
-        _surya_processor = load_processor()
-    return _surya_model, _surya_processor
+def get_surya_predictors():
+    """
+    Lazy-load Surya OCR predictors (new API: surya ≥ 0.4).
+    Forces CPU device so surya does not compete with SGLang for GPU VRAM.
+    FoundationPredictor must be created first and injected into RecognitionPredictor.
+    """
+    global _surya_foundation_predictor, _surya_rec_predictor, _surya_det_predictor
+    if _surya_rec_predictor is None:
+        # Pin surya to CPU — SGLang already occupies almost all GPU VRAM.
+        import os
+        os.environ.setdefault("TORCH_DEVICE", "cpu")
+        from surya.foundation import FoundationPredictor
+        from surya.recognition import RecognitionPredictor
+        from surya.detection import DetectionPredictor
+        logger.info("Loading Surya OCR predictors on CPU (SGLang holds GPU)...")
+        _surya_foundation_predictor = FoundationPredictor()
+        _surya_rec_predictor = RecognitionPredictor(_surya_foundation_predictor)
+        _surya_det_predictor = DetectionPredictor()
+        logger.info("Surya OCR predictors ready.")
+    return _surya_rec_predictor, _surya_det_predictor
 
 
 def _score_ocr_result(page_result) -> tuple[float, int]:
@@ -286,6 +317,57 @@ def _extract_pages_pymupdf(doc: fitz.Document) -> str:
     return "\n\n".join(page.get_text() for page in doc)
 
 
+# ---------------------------------------------------------------------------
+# Table extraction — item 10
+# ---------------------------------------------------------------------------
+
+def _table_to_markdown(rows: list[list]) -> str:
+    """
+    Convert a PyMuPDF table.extract() result to a Markdown pipe-table.
+    None cells become empty strings; short rows are padded to column count.
+    """
+    if not rows:
+        return ""
+    sanitized = [
+        [str(cell).strip() if cell is not None else "" for cell in row]
+        for row in rows
+    ]
+    n_cols = max((len(row) for row in sanitized), default=0)
+    if n_cols == 0:
+        return ""
+    rows_padded = [row + [""] * (n_cols - len(row)) for row in sanitized]
+    header = "| " + " | ".join(rows_padded[0]) + " |"
+    sep    = "| " + " | ".join("---" for _ in range(n_cols)) + " |"
+    body   = "\n".join("| " + " | ".join(row) + " |" for row in rows_padded[1:])
+    return "\n".join(filter(None, [header, sep, body]))
+
+
+def _extract_tables_as_markdown(page: fitz.Page) -> str:
+    """
+    Detect tables on a digital PDF page using PyMuPDF's built-in table finder
+    (requires PyMuPDF ≥ 1.23) and return them as Markdown pipe-tables.
+
+    Markdown tables preserve row-column relationships that plain text extraction
+    destroys — critical for invoices, schedules, lab values, and comparisons.
+
+    Returns an empty string when no tables are found or the API is unavailable.
+    """
+    try:
+        finder = page.find_tables()
+        tables = list(finder)  # TableFinder is iterable
+        if not tables:
+            return ""
+        parts = []
+        for table in tables:
+            rows = table.extract()
+            md = _table_to_markdown(rows)
+            if md:
+                parts.append(md)
+        return "\n\n".join(parts)
+    except Exception:
+        return ""
+
+
 def _classify_page(page: fitz.Page) -> tuple[bool, str, dict]:
     """
     Classify a single PDF page as digital or scanned using the same 4-signal
@@ -338,14 +420,80 @@ def _classify_page(page: fitz.Page) -> tuple[bool, str, dict]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Text cleanup — item 6
+# ---------------------------------------------------------------------------
+
+def clean_page_text(text: str) -> str:
+    """
+    Normalise raw extracted or OCR text for one page.
+
+    Operations (in order):
+    1. Rejoin words hyphenated across line breaks  ("docu-\\nment" → "document")
+    2. Standardise line endings to \\n
+    3. Collapse multiple spaces/tabs to a single space
+    4. Collapse more than two consecutive blank lines to exactly two
+    5. Strip leading/trailing whitespace from each line
+    """
+    text = re.sub(r"-\n(\w)", r"\1", text)           # dehyphenation
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)               # collapse horizontal whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)            # max two consecutive blank lines
+    lines = [line.strip() for line in text.split("\n")]
+    return "\n".join(lines).strip()
+
+
+def deduplicate_headers_footers(
+    page_texts: list[str],
+    threshold: float = 0.6,
+    max_candidates: int = 3,
+) -> list[str]:
+    """
+    Remove repeating header/footer lines from all pages.
+
+    Strategy: examine the first and last `max_candidates` lines of each page.
+    Any non-trivial line that appears on ≥ `threshold` fraction of pages is
+    treated as a repeating header/footer and stripped from every page.
+
+    Requires ≥ 3 pages to activate — fewer pages provide insufficient signal.
+    """
+    if len(page_texts) < 3:
+        return page_texts
+
+    from collections import Counter
+    line_counts: Counter = Counter()
+    n_pages = len(page_texts)
+
+    for page_text in page_texts:
+        lines = [ln.strip() for ln in page_text.split("\n") if ln.strip()]
+        candidates = set(lines[:max_candidates] + lines[-max_candidates:])
+        for line in candidates:
+            if len(line) > 3:   # ignore trivial page numbers / single chars
+                line_counts[line] += 1
+
+    repeated = {
+        line for line, count in line_counts.items()
+        if count / n_pages >= threshold
+    }
+
+    if not repeated:
+        return page_texts
+
+    logger.debug("Stripping %d repeating header/footer line(s)", len(repeated))
+    cleaned = []
+    for page_text in page_texts:
+        lines = page_text.split("\n")
+        filtered = [ln for ln in lines if ln.strip() not in repeated]
+        cleaned.append("\n".join(filtered))
+    return cleaned
+
+
 def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
     """
-    Extract text from scanned PDF using Surya OCR.
+    Extract text from scanned PDF using Surya OCR (new predictor API).
     Returns (text, page_count).
     """
-    from surya.ocr import run_ocr
-
-    model, processor = get_surya_models()
+    rec_predictor, det_predictor = get_surya_predictors()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     images = []
@@ -357,11 +505,11 @@ def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
     page_count = len(images)
     doc.close()
 
-    results = run_ocr(images, model, processor)
+    results = rec_predictor(images, det_predictor=det_predictor)
 
     pages_text = []
     for page_result in results:
-        page_lines = [line.text for line in page_result.text_lines]
+        page_lines = [line.text for line in getattr(page_result, "text_lines", [])]
         pages_text.append("\n".join(page_lines))
 
     return "\n\n".join(pages_text), page_count
@@ -399,8 +547,36 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
         page_signals.append({"page": i + 1, **signals})
 
         if is_digital:
-            page_texts[i] = text
-            page_modes.append("pymupdf")
+            # Append any structured table data found on this page (item 10)
+            table_md = _extract_tables_as_markdown(page)
+            full_text = text + ("\n\n[Tables]\n" + table_md if table_md else "")
+
+            # Post-extraction quality gate: measure char density vs page area.
+            # A page that passes the classification vote but yields almost no text
+            # (embedded-image tables, vector diagrams, encoded glyphs, etc.) is
+            # silently re-routed to OCR — no question parsing, no format detection.
+            page_area = page.rect.width * page.rect.height
+            char_density = len(full_text.strip()) / page_area if page_area > 0 else 0.0
+
+            if char_density >= MIN_CHARS_PER_SQPT:
+                page_texts[i] = full_text
+                page_modes.append("pymupdf")
+                page_signals[-1]["pymupdf_char_density"] = round(char_density, 6)
+                page_signals[-1]["pymupdf_thin_fallback"] = False
+            else:
+                # PyMuPDF result is too thin — discard it, queue page for OCR
+                pix = page.get_pixmap(dpi=OCR_RENDER_DPI)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                scanned_indices.append(i)
+                scanned_images.append(img)
+                page_modes.append("surya_ocr")
+                page_signals[-1]["pymupdf_char_density"] = round(char_density, 6)
+                page_signals[-1]["pymupdf_thin_fallback"] = True
+                logger.info(
+                    "Page %d/%d → OCR fallback: classified digital but thin "
+                    "(%.5f chars/pt² < %.5f threshold)",
+                    i + 1, page_count, char_density, MIN_CHARS_PER_SQPT,
+                )
         else:
             pix = page.get_pixmap(dpi=OCR_RENDER_DPI)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -418,13 +594,12 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
 
     # All scanned pages go through a single batched model call
     if scanned_images:
-        from surya.ocr import run_ocr
-        model, processor = get_surya_models()
+        rec_predictor, det_predictor = get_surya_predictors()
         logger.info(
             "OCR pass 1 at %d DPI on %d/%d scanned page(s)",
             OCR_RENDER_DPI, len(scanned_images), page_count,
         )
-        first_pass_results = run_ocr(scanned_images, model, processor)
+        first_pass_results = rec_predictor(scanned_images, det_predictor=det_predictor)
 
         # Assess quality; store first-pass text and confidence flags
         second_pass_doc_indices: list[int]   = []  # doc-page indices needing retry
@@ -464,7 +639,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
                 )
             doc2.close()
 
-            second_pass_results = run_ocr(second_pass_images, model, processor)
+            second_pass_results = rec_predictor(second_pass_images, det_predictor=det_predictor)
 
             for doc_idx, result in zip(second_pass_doc_indices, second_pass_results):
                 avg_conf2, line_count2 = _score_ocr_result(result)
@@ -489,6 +664,10 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]
                     )
 
             low_conf_page_indices = second_pass_doc_indices
+
+    # Item 6 — text cleanup: normalise whitespace, remove repeated headers/footers
+    page_texts = [clean_page_text(pt) for pt in page_texts]
+    page_texts = deduplicate_headers_footers(page_texts)
 
     n_scanned = len(scanned_indices)
     n_digital = page_count - n_scanned
@@ -708,23 +887,50 @@ def format_chunks_for_prompt(chunks: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def build_prompt(document_text: str, user_question: str) -> list[dict]:
-    """Build OpenAI-compatible messages array for the LLM."""
+    """
+    Build OpenAI-compatible messages for strict, page-aware document extraction.
+    """
+
     system_prompt = (
-        "You are a helpful, analytical assistant. "
-        "Read the following document carefully and answer the user's question "
-        "based strictly on the information provided in the document. "
-        "If the answer cannot be found in the document, say so clearly."
+        "You are a strict document extraction assistant.\n\n"
+        "Your task is to answer using ONLY the provided document excerpts.\n\n"
+        "Follow these rules exactly:\n"
+        "1. Use only the provided text. Do not use outside knowledge.\n"
+        "2. Do not guess or infer missing information.\n"
+        "3. Respect page boundaries strictly:\n"
+        "   - If a page number is mentioned in the question, use ONLY that page.\n"
+        "   - Never include content from other pages.\n"
+        "4. Prefer exact extraction over summarization:\n"
+        "   - Extract items exactly as written.\n"
+        "   - Preserve wording, order, and structure.\n"
+        "   - Do NOT rephrase, translate, or normalize.\n"
+        "5. For list questions:\n"
+        "   - Return ONLY a clean bullet list.\n"
+        "   - No explanations, no headings, no extra text.\n"
+        "6. For table data:\n"
+        "   - Preserve row-level meaning.\n"
+        "   - Do not mix values from different rows.\n"
+        "7. If the answer is not explicitly present, return exactly:\n"
+        "   NOT FOUND\n"
+        "8. Do not explain your reasoning.\n"
+        "9. Do not mention page numbers in the output unless explicitly asked.\n\n"
+        "Priority:\n"
+        "Exactness > Completeness > Fluency"
     )
 
-    user_content = f"""## Document Content
-
-{document_text}
-
----
-
-## Question
-
-{user_question}"""
+    user_content = (
+        "## Document Excerpts\n\n"
+        f"{document_text}\n\n"
+        "---\n\n"
+        "## Question\n\n"
+        f"{user_question}\n\n"
+        "---\n\n"
+        "## Instructions\n"
+        "Return the answer exactly in the format requested.\n"
+        "If the question mentions a specific page, use only that page.\n"
+        "If listing items, extract them exactly as written and in order.\n"
+        "If not found, return: NOT FOUND"
+    )
 
     return [
         {"role": "system", "content": system_prompt},
@@ -755,8 +961,8 @@ async def query_llm(
             json={
                 "messages": messages,
                 "stream": True,
-                "max_tokens": 2048,
-                "temperature": 0.7,
+                "max_tokens": MAX_OUTPUT_TOKENS,
+                "temperature": LLM_TEMPERATURE,
             },
         ) as response:
             if response.status_code != 200:
@@ -844,11 +1050,23 @@ async def analyze_pdf(
 
     chunks = chunk_document(page_texts_list)
 
+    # Item 9 — dynamic token budget: shrink document context to fit the full
+    # conversation (system prompt + question + output reserve) within MAX_TOTAL_TOKENS.
+    _sys_chars      = len(build_prompt("", "")[0]["content"])
+    _question_chars = len(question)
+    _output_reserve = MAX_OUTPUT_TOKENS * CHARS_PER_TOKEN
+    doc_budget_chars = max(
+        MAX_TOTAL_TOKENS * CHARS_PER_TOKEN - _sys_chars - _question_chars - _output_reserve,
+        2000,   # floor: always allow at least a small context window
+    )
+
     # Rank all chunks by relevance to the question
     ranked_chunks, retrieval_info = retrieve_relevant_chunks(question, chunks)
 
-    # Apply token budget — now fills with the most relevant chunks first
-    selected_chunks, budget_info = select_chunks_within_budget(ranked_chunks)
+    # Apply dynamic token budget — fills with the most relevant chunks first
+    selected_chunks, budget_info = select_chunks_within_budget(
+        ranked_chunks, max_chars=doc_budget_chars
+    )
 
     # Re-sort selected chunks into document (page) order so the context reads
     # coherently: the model sees page 3 before page 24, not relevance order
@@ -919,8 +1137,8 @@ async def analyze_pdf(
             },
             "model": {
                 "id": _active_model,
-                "temperature": 0.7,
-                "max_tokens": 2048,
+                "temperature": LLM_TEMPERATURE,
+                "max_tokens": MAX_OUTPUT_TOKENS,
                 "sglang_url": SGLANG_URL,
             },
             "performance": {
@@ -934,8 +1152,12 @@ async def analyze_pdf(
             },
             "quality_signals": {
                 "response_empty": len(full_output.strip()) == 0,
-                "said_not_found": "cannot be found" in full_output.lower()
-                or "not found in the document" in full_output.lower(),
+                "said_not_found": (
+                    "not found:" in full_output.lower()
+                    or "cannot be found" in full_output.lower()
+                    or "not found in the document" in full_output.lower()
+                    or "do not contain sufficient" in full_output.lower()
+                ),
                 "answer_latency_per_input_token_ms": answer_latency_per_input_token_ms,
             },
         }
