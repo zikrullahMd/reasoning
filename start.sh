@@ -1,11 +1,23 @@
 #!/bin/bash
 set -e
 
-# Configuration
-MODEL_PATH="${MODEL_PATH:-YOUR_MODEL_HERE}"  # Override with: MODEL_PATH="meta-llama/..." ./start.sh
-SGLANG_PORT=30000
-FASTAPI_PORT=8000
-SGLANG_LOG="sglang.log"
+# ---------------------------------------------------------------------------
+# Load .env.local if it exists (values set here can still be overridden by
+# environment variables already exported before this script runs)
+# ---------------------------------------------------------------------------
+if [ -f ".env.local" ]; then
+    echo "Loading .env.local..."
+    set -o allexport
+    # shellcheck disable=SC1091
+    source .env.local
+    set +o allexport
+fi
+
+# Configuration (can be overridden via .env.local or env vars)
+MODEL_PATH="${MODEL_PATH:-YOUR_MODEL_HERE}"  # Qwen model for SGLang
+SGLANG_PORT="${SGLANG_PORT:-30000}"
+FASTAPI_PORT="${FASTAPI_PORT:-8000}"
+SGLANG_LOG="${SGLANG_LOG:-sglang.log}"
 
 echo "=== PDF Inference Pipeline Startup ==="
 
@@ -118,8 +130,11 @@ echo ""
 echo "Press Ctrl+C to stop"
 echo ""
 
-# Force Surya OCR to run on CPU so it doesn't compete with SGLang for GPU VRAM.
-export TORCH_DEVICE="${TORCH_DEVICE:-cpu}"
+export SGLANG_URL="${SGLANG_URL:-http://localhost:${SGLANG_PORT}}"
+export CHANDRA_URL="${CHANDRA_URL:-http://localhost:8000}"
 
-export SGLANG_URL="http://localhost:${SGLANG_PORT}"
+echo "  SGLANG_URL  = $SGLANG_URL"
+echo "  CHANDRA_URL = $CHANDRA_URL"
+echo ""
+
 exec uvicorn server:app --host 0.0.0.0 --port $FASTAPI_PORT

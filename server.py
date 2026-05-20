@@ -3,90 +3,82 @@ PDF Inference Pipeline Server (2026 Stack)
 
 FastAPI server that:
 1. Accepts PDF uploads + questions
-2. Extracts text via PyMuPDF (digital) or Surya OCR (scanned)
-3. Streams LLM responses from SGLang inference server
-4. Logs structured performance metrics to metrics.jsonl
+2. Renders PDF pages to images and extracts text via Chandra OCR vLLM API
+3. Retrieves relevant chunks using BM25 with context-budget management
+4. Streams reasoning responses from Qwen via SGLang/vLLM
+5. Logs structured performance metrics to metrics.jsonl
 """
 
+import asyncio
+import base64
+import copy
+import hashlib
 import json
 import logging
 import os
+import pickle
 import re
+import threading
 import time
 import uuid
+from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator
 
-import fitz  # PyMuPDF
+import fitz  # PyMuPDF — used only for PDF → PNG rendering
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from PIL import Image
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-# BM25 retrieval — optional dependency; falls back to positional selection if absent
+# BM25 retrieval — optional; falls back to positional selection if absent
 try:
     from rank_bm25 import BM25Okapi as _BM25Okapi
     _BM25_AVAILABLE = True
 except ImportError:
-    _BM25Okapi = None   # type: ignore[assignment,misc]
+    _BM25Okapi = None  # type: ignore[assignment,misc]
     _BM25_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Qwen reasoning model served via SGLang / vLLM
 SGLANG_URL = os.getenv("SGLANG_URL", "http://localhost:30000")
 
-# --- PDF classification thresholds (multi-signal) ---
-MIN_TEXT_DENSITY = 50           # avg chars/page: below → no meaningful text
-MIN_DIGITAL_FONT_RATIO = 0.5   # fraction of pages that must carry embedded fonts
-MAX_SCANNED_IMAGE_RATIO = 0.6  # avg image-area/page-area: above → full-page scan image
-MIN_TEXT_BLOCK_DENSITY = 2.0   # avg text blocks/page: below → no structural text
-CLASSIFICATION_VOTES_NEEDED = 3 # signals (out of 4) required to call a PDF "digital"
+# Chandra OCR model served via vLLM
+CHANDRA_URL = os.getenv("CHANDRA_URL", "http://localhost:8000")
+CHANDRA_OCR_DPI = int(os.getenv("CHANDRA_OCR_DPI", "150"))
 
-# --- OCR quality settings ---
-OCR_RENDER_DPI           = 200   # base render resolution (higher → better OCR, more RAM)
-OCR_CONFIDENCE_THRESHOLD = 0.70  # avg line-confidence below this → attempt second pass
-OCR_SECOND_PASS_DPI      = 300   # re-render resolution for low-confidence pages
-OCR_MIN_LINES_FOR_QUALITY = 3    # minimum lines needed for a meaningful confidence signal
-
-# --- Post-extraction quality gate ---
-# A digital page that yields fewer chars than this per point² of page area is
-# considered "thin" — PyMuPDF extracted something but not enough to be useful.
-# The page is silently re-routed to OCR regardless of the classification vote.
-# A4 ≈ 501 000 pt² → threshold ≈ 150 chars minimum on a full page.
-MIN_CHARS_PER_SQPT = float(os.getenv("MIN_CHARS_PER_SQPT", "0.0003"))
-
-# --- Context / token budget ---
+# Context / token budget
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "6000"))
-CHARS_PER_TOKEN    = 4           # rough approximation (1 token ≈ 4 chars)
-MAX_CONTEXT_CHARS  = MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN  # 24 000 chars
-MAX_CHUNK_CHARS    = 1500        # max chars per individual chunk (~375 tokens)
+CHARS_PER_TOKEN = 4
+MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "1500"))
 
-# --- BM25 retrieval ---
-# Retrieve this many top-scored chunks; the budget cap then selects how many fit.
-# Setting it higher than needed is fine — budget is the hard limit.
+# BM25 retrieval
 BM25_TOP_K = int(os.getenv("BM25_TOP_K", "30"))
 
-# --- LLM behaviour (item 7) ---
-# Low temperature (0.0–0.15) keeps the model grounded on document text.
-# 0.7 is creative writing; 0.1 is precise extraction.
-LLM_TEMPERATURE   = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+# LLM behaviour
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "2048"))
-
-# --- Dynamic token budget (item 9) ---
-# Total practical context window to target.  Document budget is computed
-# per-request as: total - system_prompt - question - output_reserve.
 MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "8000"))
+
+# Early exit — probe with top-K chunks before sending full context
+EARLY_EXIT_TOP_K = int(os.getenv("EARLY_EXIT_TOP_K", "3"))
+EARLY_EXIT_BM25_THRESHOLD = float(os.getenv("EARLY_EXIT_BM25_THRESHOLD", "0.5"))
 
 METRICS_LOG_PATH = Path(os.getenv("METRICS_LOG", "metrics.jsonl"))
 
+# PDF extraction cache
+CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "100"))
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "pdf_cache"))
+
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -97,13 +89,68 @@ logger = logging.getLogger("pipeline")
 perf_logger = logging.getLogger("perf")
 
 # ---------------------------------------------------------------------------
-# Surya OCR lazy state + active model cache
+# Global state
 # ---------------------------------------------------------------------------
 
-_surya_foundation_predictor = None  # surya.foundation.FoundationPredictor
-_surya_rec_predictor = None         # surya.recognition.RecognitionPredictor
-_surya_det_predictor = None         # surya.detection.DetectionPredictor
-_active_model: str = "unknown"
+_active_model: str = "unknown"   # Qwen / SGLang reasoning model
+_chandra_model: str = "unknown"  # Chandra OCR model
+
+_extraction_cache: OrderedDict = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _pdf_hash(pdf_bytes: bytes) -> str:
+    return hashlib.sha256(pdf_bytes).hexdigest()
+
+
+def _disk_path(pdf_hash: str) -> Path:
+    return CACHE_DIR / f"{pdf_hash}.pkl"
+
+
+def _cache_get(pdf_hash: str) -> dict | None:
+    """Return a deep copy of a cached extraction result, or None on miss."""
+    with _cache_lock:
+        if pdf_hash in _extraction_cache:
+            _extraction_cache.move_to_end(pdf_hash)
+            logger.info("Cache hit (memory) for %s…", pdf_hash[:12])
+            return copy.deepcopy(_extraction_cache[pdf_hash])
+
+    disk_file = _disk_path(pdf_hash)
+    if disk_file.exists():
+        try:
+            with disk_file.open("rb") as f:
+                entry = pickle.load(f)
+            with _cache_lock:
+                _extraction_cache[pdf_hash] = copy.deepcopy(entry)
+                _extraction_cache.move_to_end(pdf_hash)
+                if len(_extraction_cache) > CACHE_MAX_ENTRIES:
+                    _extraction_cache.popitem(last=False)
+            logger.info("Cache hit (disk) for %s…", pdf_hash[:12])
+            return copy.deepcopy(entry)
+        except Exception as exc:
+            logger.warning("Failed to load disk cache entry %s: %s", pdf_hash[:12], exc)
+
+    return None
+
+
+def _cache_put(pdf_hash: str, entry: dict) -> None:
+    """Store extraction result in memory LRU and on disk."""
+    stored = copy.deepcopy(entry)
+    with _cache_lock:
+        _extraction_cache[pdf_hash] = stored
+        _extraction_cache.move_to_end(pdf_hash)
+        if len(_extraction_cache) > CACHE_MAX_ENTRIES:
+            _extraction_cache.popitem(last=False)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with _disk_path(pdf_hash).open("wb") as f:
+            pickle.dump(stored, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        logger.warning("Failed to write disk cache entry %s: %s", pdf_hash[:12], exc)
 
 
 # ---------------------------------------------------------------------------
@@ -111,34 +158,41 @@ _active_model: str = "unknown"
 # ---------------------------------------------------------------------------
 
 def _append_metric(record: dict) -> None:
-    """Append a JSON record as a single line to the JSONL metrics log."""
     try:
         with METRICS_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
         logger.warning("Failed to write metrics log: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — probe SGLang for the active model at startup
+# Lifespan — probe both services for active model names at startup
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _active_model
-    logger.info("Starting up — probing SGLang for active model...")
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+    global _active_model, _chandra_model
+    logger.info("Starting up — probing Chandra OCR and Qwen/SGLang...")
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
             resp = await client.get(f"{SGLANG_URL}/v1/models")
             if resp.status_code == 200:
                 models = resp.json().get("data", [])
                 if models:
                     _active_model = models[0].get("id", "unknown")
-                    logger.info("Active model: %s", _active_model)
-                else:
-                    logger.warning("SGLang returned no models")
-    except Exception as exc:
-        logger.warning("Could not fetch model at startup: %s", exc)
+                    logger.info("Qwen/SGLang model: %s", _active_model)
+        except Exception as exc:
+            logger.warning("Could not probe SGLang at startup: %s", exc)
+
+        try:
+            resp = await client.get(f"{CHANDRA_URL}/v1/models")
+            if resp.status_code == 200:
+                models = resp.json().get("data", [])
+                if models:
+                    _chandra_model = models[0].get("id", "unknown")
+                    logger.info("Chandra OCR model: %s", _chandra_model)
+        except Exception as exc:
+            logger.warning("Could not probe Chandra OCR at startup: %s", exc)
     yield
 
 
@@ -148,15 +202,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PDF Inference Pipeline",
-    description="Upload PDFs and ask questions - powered by SGLang",
-    version="1.0.0",
+    description="Upload PDFs and ask questions — Chandra OCR + Qwen reasoning",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-
-# ---------------------------------------------------------------------------
-# Middleware — HTTP-level timing + request identity headers
-# ---------------------------------------------------------------------------
 
 class TimingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -180,265 +230,148 @@ app.add_middleware(TimingMiddleware)
 
 
 # ---------------------------------------------------------------------------
-# Surya OCR
+# PDF → PNG rendering
 # ---------------------------------------------------------------------------
 
-def get_surya_predictors():
-    """
-    Lazy-load Surya OCR predictors (new API: surya ≥ 0.4).
-    Forces CPU device so surya does not compete with SGLang for GPU VRAM.
-    FoundationPredictor must be created first and injected into RecognitionPredictor.
-    """
-    global _surya_foundation_predictor, _surya_rec_predictor, _surya_det_predictor
-    if _surya_rec_predictor is None:
-        # Pin surya to CPU — SGLang already occupies almost all GPU VRAM.
-        import os
-        os.environ.setdefault("TORCH_DEVICE", "cpu")
-        from surya.foundation import FoundationPredictor
-        from surya.recognition import RecognitionPredictor
-        from surya.detection import DetectionPredictor
-        logger.info("Loading Surya OCR predictors on CPU (SGLang holds GPU)...")
-        _surya_foundation_predictor = FoundationPredictor()
-        _surya_rec_predictor = RecognitionPredictor(_surya_foundation_predictor)
-        _surya_det_predictor = DetectionPredictor()
-        logger.info("Surya OCR predictors ready.")
-    return _surya_rec_predictor, _surya_det_predictor
-
-
-def _score_ocr_result(page_result) -> tuple[float, int]:
-    """
-    Compute average confidence and line count from a Surya OCR page result.
-
-    Surya's TextLine objects carry a `confidence` float in [0, 1].
-    We use getattr with a safe default so the function stays compatible with
-    future Surya versions that might rename the field.
-
-    Returns (avg_confidence, line_count).
-    avg_confidence is 0.0 when there are no lines (blank / failed page).
-    """
-    lines = getattr(page_result, "text_lines", [])
-    if not lines:
-        return 0.0, 0
-    confidences = [getattr(line, "confidence", 1.0) for line in lines]
-    return sum(confidences) / len(confidences), len(lines)
+def _render_page_to_png_bytes(page: fitz.Page, dpi: int) -> bytes:
+    """Render a single PDF page to PNG bytes at the given DPI."""
+    pix = page.get_pixmap(dpi=dpi, alpha=False)
+    return pix.tobytes("png")
 
 
 # ---------------------------------------------------------------------------
-# PDF extraction
+# Chandra OCR API extraction
 # ---------------------------------------------------------------------------
 
-def _classify_pdf_nature(doc: fitz.Document) -> dict:
+async def _ocr_page_with_chandra(
+    b64_image: str,
+    page_num: int,
+    client: httpx.AsyncClient,
+) -> str:
     """
-    Multi-signal heuristic that decides whether a PDF is digital or scanned.
-
-    Four independent signals are each voted as digital (1) or scanned (0).
-    A final majority vote (CLASSIFICATION_VOTES_NEEDED of 4) gives the verdict.
-
-    Signals
-    -------
-    1. char_density   – avg extracted chars/page  (low → no selectable text)
-    2. font_ratio     – fraction of pages with embedded fonts (absent → raster scan)
-    3. image_ratio    – avg image area / page area (high → full-page scan background)
-    4. text_blocks    – avg PyMuPDF text-block count/page (near-zero → no structure)
-
-    Returns a dict with 'is_digital', 'digital_votes', 'confidence', and 'signals'.
+    Send one page image to the Chandra OCR vLLM server via /v1/chat/completions
+    and return the extracted markdown text.
     """
+    payload = {
+        "model": _chandra_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Convert this document page to markdown. "
+                            "Preserve all text, tables, headings, and layout. "
+                            "Output only the extracted content — no commentary."
+                        ),
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 4096,
+        "temperature": 0.0,
+    }
+
+    resp = await client.post(
+        f"{CHANDRA_URL}/v1/chat/completions",
+        json=payload,
+        timeout=300.0,
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Chandra OCR page {page_num} HTTP {resp.status_code}: {resp.text[:400]}"
+        )
+
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+async def extract_text_with_chandra_api(
+    pdf_bytes: bytes,
+    filename: str = "input.pdf",
+) -> tuple[str, str, int, float, dict]:
+    """
+    Extract text from all PDF pages by:
+      1. Rendering each page to a PNG using PyMuPDF
+      2. Sending all pages concurrently to the Chandra OCR vLLM API
+
+    Returns: (document_text, extraction_method, page_count, extraction_time_s, classification)
+    """
+    t0 = time.perf_counter()
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_count = len(doc)
-    if page_count == 0:
-        return {"is_digital": False, "digital_votes": 0, "confidence": "low", "signals": {}}
 
-    total_chars = 0
-    pages_with_fonts = 0
-    total_image_ratio = 0.0
-    total_text_blocks = 0
-
+    logger.info(
+        "Rendering %d PDF page(s) to PNG at %d DPI...", page_count, CHANDRA_OCR_DPI
+    )
+    page_images_b64: list[str] = []
     for page in doc:
-        # Signal 1 — character count from selectable text layer
-        text = page.get_text()
-        total_chars += len(text.strip())
+        png_bytes = _render_page_to_png_bytes(page, CHANDRA_OCR_DPI)
+        page_images_b64.append(base64.b64encode(png_bytes).decode())
+    doc.close()
 
-        # Signal 2 — embedded font presence
-        if page.get_fonts():
-            pages_with_fonts += 1
+    logger.info(
+        "Sending %d page(s) to Chandra OCR API at %s (concurrent)...",
+        page_count,
+        CHANDRA_URL,
+    )
+    async with httpx.AsyncClient() as client:
+        page_texts: list[str] = list(
+            await asyncio.gather(
+                *[
+                    _ocr_page_with_chandra(img_b64, i + 1, client)
+                    for i, img_b64 in enumerate(page_images_b64)
+                ]
+            )
+        )
 
-        # Signal 3 — image area coverage
-        page_area = page.rect.width * page.rect.height
-        if page_area > 0:
-            img_area = 0.0
-            for info in page.get_image_info():
-                bbox = info.get("bbox", (0, 0, 0, 0))
-                img_area += abs((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
-            total_image_ratio += min(img_area / page_area, 1.0)
+    page_texts = [clean_page_text(t) for t in page_texts]
+    page_texts = deduplicate_headers_footers(page_texts)
 
-        # Signal 4 — text block count (block_type 0 = text, 1 = image)
-        blocks = page.get_text("blocks")
-        total_text_blocks += sum(1 for b in blocks if len(b) > 6 and b[6] == 0)
+    document_text = "\n\n".join(pt for pt in page_texts if pt)
 
-    avg_chars = total_chars / page_count
-    font_page_ratio = pages_with_fonts / page_count
-    avg_image_ratio = total_image_ratio / page_count
-    avg_text_blocks = total_text_blocks / page_count
+    elapsed = round(time.perf_counter() - t0, 4)
+    logger.info(
+        "Chandra OCR complete: %d pages in %.2fs (%.2f pages/s)",
+        page_count,
+        elapsed,
+        page_count / elapsed if elapsed > 0 else 0.0,
+    )
 
-    sig_chars = avg_chars >= MIN_TEXT_DENSITY
-    sig_fonts = font_page_ratio >= MIN_DIGITAL_FONT_RATIO
-    sig_images = avg_image_ratio < MAX_SCANNED_IMAGE_RATIO
-    sig_blocks = avg_text_blocks >= MIN_TEXT_BLOCK_DENSITY
-
-    digital_votes = sum([sig_chars, sig_fonts, sig_images, sig_blocks])
-    is_digital = digital_votes >= CLASSIFICATION_VOTES_NEEDED
-
-    # 4/4 or 0/4 → high confidence; 3/4 or 1/4 → medium; 2/4 → ambiguous
-    if digital_votes in (0, 4):
-        confidence = "high"
-    elif digital_votes in (1, 3):
-        confidence = "medium"
-    else:
-        confidence = "low"
-
-    return {
-        "is_digital": is_digital,
-        "digital_votes": digital_votes,
-        "confidence": confidence,
-        "signals": {
-            "avg_chars_per_page": round(avg_chars, 1),
-            "char_density_ok": sig_chars,
-            "font_page_ratio": round(font_page_ratio, 3),
-            "fonts_ok": sig_fonts,
-            "avg_image_area_ratio": round(avg_image_ratio, 3),
-            "image_ratio_ok": sig_images,
-            "avg_text_blocks_per_page": round(avg_text_blocks, 1),
-            "text_blocks_ok": sig_blocks,
+    classification = {
+        "is_mixed": False,
+        "digital_page_count": 0,
+        "scanned_page_count": page_count,
+        "page_modes": ["chandra_api"] * page_count,
+        "page_signals": [],
+        "ocr_quality": {
+            "engine": "chandra",
+            "method": "vllm_api",
+            "model": _chandra_model,
+            "dpi": CHANDRA_OCR_DPI,
         },
+        "_page_texts": page_texts,
     }
 
-
-def _extract_pages_pymupdf(doc: fitz.Document) -> str:
-    """Return concatenated page text from an already-open PyMuPDF document."""
-    return "\n\n".join(page.get_text() for page in doc)
+    return document_text, "chandra_api", page_count, elapsed, classification
 
 
 # ---------------------------------------------------------------------------
-# Table extraction — item 10
-# ---------------------------------------------------------------------------
-
-def _table_to_markdown(rows: list[list]) -> str:
-    """
-    Convert a PyMuPDF table.extract() result to a Markdown pipe-table.
-    None cells become empty strings; short rows are padded to column count.
-    """
-    if not rows:
-        return ""
-    sanitized = [
-        [str(cell).strip() if cell is not None else "" for cell in row]
-        for row in rows
-    ]
-    n_cols = max((len(row) for row in sanitized), default=0)
-    if n_cols == 0:
-        return ""
-    rows_padded = [row + [""] * (n_cols - len(row)) for row in sanitized]
-    header = "| " + " | ".join(rows_padded[0]) + " |"
-    sep    = "| " + " | ".join("---" for _ in range(n_cols)) + " |"
-    body   = "\n".join("| " + " | ".join(row) + " |" for row in rows_padded[1:])
-    return "\n".join(filter(None, [header, sep, body]))
-
-
-def _extract_tables_as_markdown(page: fitz.Page) -> str:
-    """
-    Detect tables on a digital PDF page using PyMuPDF's built-in table finder
-    (requires PyMuPDF ≥ 1.23) and return them as Markdown pipe-tables.
-
-    Markdown tables preserve row-column relationships that plain text extraction
-    destroys — critical for invoices, schedules, lab values, and comparisons.
-
-    Returns an empty string when no tables are found or the API is unavailable.
-    """
-    try:
-        finder = page.find_tables()
-        tables = list(finder)  # TableFinder is iterable
-        if not tables:
-            return ""
-        parts = []
-        for table in tables:
-            rows = table.extract()
-            md = _table_to_markdown(rows)
-            if md:
-                parts.append(md)
-        return "\n\n".join(parts)
-    except Exception:
-        return ""
-
-
-def _classify_page(page: fitz.Page) -> tuple[bool, str, dict]:
-    """
-    Classify a single PDF page as digital or scanned using the same 4-signal
-    vote as the document-level classifier.
-
-    Uses page.get_text("blocks") in one call to derive both the plain text
-    content and the text-block count, avoiding a second page read.
-
-    Returns
-    -------
-    is_digital : bool
-    text       : str   – extracted text (only meaningful when is_digital=True)
-    signals    : dict  – per-signal values and vote breakdown
-    """
-    raw_blocks = page.get_text("blocks")
-    text_blocks = [b for b in raw_blocks if len(b) > 6 and b[6] == 0]
-    plain_text = "\n".join(b[4] for b in text_blocks)
-    char_count = len(plain_text.strip())
-    text_block_count = len(text_blocks)
-
-    has_fonts = bool(page.get_fonts())
-
-    page_area = page.rect.width * page.rect.height
-    img_ratio = 0.0
-    if page_area > 0:
-        img_area = 0.0
-        for info in page.get_image_info():
-            bbox = info.get("bbox", (0, 0, 0, 0))
-            img_area += abs((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
-        img_ratio = min(img_area / page_area, 1.0)
-
-    sig_chars  = char_count       >= MIN_TEXT_DENSITY
-    sig_fonts  = has_fonts
-    sig_images = img_ratio        <  MAX_SCANNED_IMAGE_RATIO
-    sig_blocks = text_block_count >= MIN_TEXT_BLOCK_DENSITY
-
-    votes = sum([sig_chars, sig_fonts, sig_images, sig_blocks])
-    is_digital = votes >= CLASSIFICATION_VOTES_NEEDED
-
-    return is_digital, plain_text, {
-        "char_count":       char_count,
-        "char_density_ok":  sig_chars,
-        "has_fonts":        has_fonts,
-        "fonts_ok":         sig_fonts,
-        "image_area_ratio": round(img_ratio, 3),
-        "image_ratio_ok":   sig_images,
-        "text_block_count": text_block_count,
-        "text_blocks_ok":   sig_blocks,
-        "digital_votes":    votes,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Text cleanup — item 6
+# Text post-processing (applied to Chandra markdown output)
 # ---------------------------------------------------------------------------
 
 def clean_page_text(text: str) -> str:
-    """
-    Normalise raw extracted or OCR text for one page.
-
-    Operations (in order):
-    1. Rejoin words hyphenated across line breaks  ("docu-\\nment" → "document")
-    2. Standardise line endings to \\n
-    3. Collapse multiple spaces/tabs to a single space
-    4. Collapse more than two consecutive blank lines to exactly two
-    5. Strip leading/trailing whitespace from each line
-    """
-    text = re.sub(r"-\n(\w)", r"\1", text)           # dehyphenation
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)               # collapse horizontal whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text)            # max two consecutive blank lines
+    text = re.sub(r"-\n(\w)", r"\1", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     lines = [line.strip() for line in text.split("\n")]
     return "\n".join(lines).strip()
 
@@ -448,19 +381,7 @@ def deduplicate_headers_footers(
     threshold: float = 0.6,
     max_candidates: int = 3,
 ) -> list[str]:
-    """
-    Remove repeating header/footer lines from all pages.
-
-    Strategy: examine the first and last `max_candidates` lines of each page.
-    Any non-trivial line that appears on ≥ `threshold` fraction of pages is
-    treated as a repeating header/footer and stripped from every page.
-
-    Requires ≥ 3 pages to activate — fewer pages provide insufficient signal.
-    """
-    if len(page_texts) < 3:
-        return page_texts
-
-    from collections import Counter
+    """Remove lines that appear as headers/footers on >= threshold fraction of pages."""
     line_counts: Counter = Counter()
     n_pages = len(page_texts)
 
@@ -468,18 +389,15 @@ def deduplicate_headers_footers(
         lines = [ln.strip() for ln in page_text.split("\n") if ln.strip()]
         candidates = set(lines[:max_candidates] + lines[-max_candidates:])
         for line in candidates:
-            if len(line) > 3:   # ignore trivial page numbers / single chars
+            if len(line) > 3:
                 line_counts[line] += 1
 
     repeated = {
-        line for line, count in line_counts.items()
-        if count / n_pages >= threshold
+        line for line, count in line_counts.items() if count / n_pages >= threshold
     }
-
     if not repeated:
         return page_texts
 
-    logger.debug("Stripping %d repeating header/footer line(s)", len(repeated))
     cleaned = []
     for page_text in page_texts:
         lines = page_text.split("\n")
@@ -488,395 +406,153 @@ def deduplicate_headers_footers(
     return cleaned
 
 
-def extract_text_surya(pdf_bytes: bytes) -> tuple[str, int]:
-    """
-    Extract text from scanned PDF using Surya OCR (new predictor API).
-    Returns (text, page_count).
-    """
-    rec_predictor, det_predictor = get_surya_predictors()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-    images = []
-    for page in doc:
-        pix = page.get_pixmap(dpi=OCR_RENDER_DPI)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append(img)
-
-    page_count = len(images)
-    doc.close()
-
-    results = rec_predictor(images, det_predictor=det_predictor)
-
-    pages_text = []
-    for page_result in results:
-        page_lines = [line.text for line in getattr(page_result, "text_lines", [])]
-        pages_text.append("\n".join(page_lines))
-
-    return "\n\n".join(pages_text), page_count
-
-
-def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str, int, float, dict]:
-    """
-    Extract text from a PDF using a per-page digital/scanned decision.
-
-    Each page is independently classified with the 4-signal vote.  Digital
-    pages are read via PyMuPDF; scanned pages are rendered to images and
-    collected for a single batched Surya OCR call.  Mixed documents (some
-    digital, some scanned) are handled correctly without skipping any page.
-
-    Returns
-    -------
-    text              : str   – full document text, pages joined by double newline
-    extraction_method : str   – 'pymupdf' | 'surya_ocr' | 'mixed'
-    page_count        : int
-    extraction_time_s : float
-    classification    : dict  – per-page modes, signals, and document-level summary
-    """
-    t0 = time.perf_counter()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_count = len(doc)
-
-    page_texts: list[str]             = [""] * page_count
-    page_modes: list[str]             = []
-    page_signals: list[dict]          = []
-    scanned_indices: list[int]        = []
-    scanned_images: list[Image.Image] = []
-
-    for i, page in enumerate(doc):
-        is_digital, text, signals = _classify_page(page)
-        page_signals.append({"page": i + 1, **signals})
-
-        if is_digital:
-            # Append any structured table data found on this page (item 10)
-            table_md = _extract_tables_as_markdown(page)
-            full_text = text + ("\n\n[Tables]\n" + table_md if table_md else "")
-
-            # Post-extraction quality gate: measure char density vs page area.
-            # A page that passes the classification vote but yields almost no text
-            # (embedded-image tables, vector diagrams, encoded glyphs, etc.) is
-            # silently re-routed to OCR — no question parsing, no format detection.
-            page_area = page.rect.width * page.rect.height
-            char_density = len(full_text.strip()) / page_area if page_area > 0 else 0.0
-
-            if char_density >= MIN_CHARS_PER_SQPT:
-                page_texts[i] = full_text
-                page_modes.append("pymupdf")
-                page_signals[-1]["pymupdf_char_density"] = round(char_density, 6)
-                page_signals[-1]["pymupdf_thin_fallback"] = False
-            else:
-                # PyMuPDF result is too thin — discard it, queue page for OCR
-                pix = page.get_pixmap(dpi=OCR_RENDER_DPI)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                scanned_indices.append(i)
-                scanned_images.append(img)
-                page_modes.append("surya_ocr")
-                page_signals[-1]["pymupdf_char_density"] = round(char_density, 6)
-                page_signals[-1]["pymupdf_thin_fallback"] = True
-                logger.info(
-                    "Page %d/%d → OCR fallback: classified digital but thin "
-                    "(%.5f chars/pt² < %.5f threshold)",
-                    i + 1, page_count, char_density, MIN_CHARS_PER_SQPT,
-                )
-        else:
-            pix = page.get_pixmap(dpi=OCR_RENDER_DPI)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            scanned_indices.append(i)
-            scanned_images.append(img)
-            page_modes.append("surya_ocr")
-            logger.debug(
-                "Page %d/%d → OCR (votes=%d/4)", i + 1, page_count, signals["digital_votes"]
-            )
-
-    doc.close()
-
-    # Track which doc-page indices needed a second pass (used for classification summary)
-    low_conf_page_indices: list[int] = []
-
-    # All scanned pages go through a single batched model call
-    if scanned_images:
-        rec_predictor, det_predictor = get_surya_predictors()
-        logger.info(
-            "OCR pass 1 at %d DPI on %d/%d scanned page(s)",
-            OCR_RENDER_DPI, len(scanned_images), page_count,
-        )
-        first_pass_results = rec_predictor(scanned_images, det_predictor=det_predictor)
-
-        # Assess quality; store first-pass text and confidence flags
-        second_pass_doc_indices: list[int]   = []  # doc-page indices needing retry
-        second_pass_images:      list[Image.Image] = []
-
-        for local_i, (doc_idx, result) in enumerate(zip(scanned_indices, first_pass_results)):
-            avg_conf, line_count = _score_ocr_result(result)
-            needs_second_pass = (
-                line_count >= OCR_MIN_LINES_FOR_QUALITY
-                and avg_conf < OCR_CONFIDENCE_THRESHOLD
-            )
-            page_texts[doc_idx] = "\n".join(
-                line.text for line in getattr(result, "text_lines", [])
-            )
-            page_signals[doc_idx].update({
-                "ocr_avg_confidence":    round(avg_conf, 4),
-                "ocr_line_count":        line_count,
-                "ocr_low_confidence":    needs_second_pass,
-                "ocr_second_pass_used":  False,
-            })
-            if needs_second_pass:
-                second_pass_doc_indices.append(doc_idx)
-
-        # Second pass: re-render only the low-confidence pages at higher DPI
-        if second_pass_doc_indices:
-            logger.info(
-                "OCR pass 2 at %d DPI for %d low-confidence page(s): %s",
-                OCR_SECOND_PASS_DPI,
-                len(second_pass_doc_indices),
-                [p + 1 for p in second_pass_doc_indices],
-            )
-            doc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
-            for doc_idx in second_pass_doc_indices:
-                pix = doc2[doc_idx].get_pixmap(dpi=OCR_SECOND_PASS_DPI)
-                second_pass_images.append(
-                    Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                )
-            doc2.close()
-
-            second_pass_results = rec_predictor(second_pass_images, det_predictor=det_predictor)
-
-            for doc_idx, result in zip(second_pass_doc_indices, second_pass_results):
-                avg_conf2, line_count2 = _score_ocr_result(result)
-                prev_conf = page_signals[doc_idx]["ocr_avg_confidence"]
-                if avg_conf2 > prev_conf:
-                    page_texts[doc_idx] = "\n".join(
-                        line.text for line in getattr(result, "text_lines", [])
-                    )
-                    page_signals[doc_idx].update({
-                        "ocr_avg_confidence":   round(avg_conf2, 4),
-                        "ocr_line_count":       line_count2,
-                        "ocr_second_pass_used": True,
-                    })
-                    logger.debug(
-                        "Page %d: pass 2 improved confidence %.3f → %.3f",
-                        doc_idx + 1, prev_conf, avg_conf2,
-                    )
-                else:
-                    logger.debug(
-                        "Page %d: pass 2 no improvement (%.3f vs %.3f), keeping pass 1",
-                        doc_idx + 1, avg_conf2, prev_conf,
-                    )
-
-            low_conf_page_indices = second_pass_doc_indices
-
-    # Item 6 — text cleanup: normalise whitespace, remove repeated headers/footers
-    page_texts = [clean_page_text(pt) for pt in page_texts]
-    page_texts = deduplicate_headers_footers(page_texts)
-
-    n_scanned = len(scanned_indices)
-    n_digital = page_count - n_scanned
-
-    if n_scanned == 0:
-        method = "pymupdf"
-    elif n_digital == 0:
-        method = "surya_ocr"
-    else:
-        method = "mixed"
-
-    logger.info(
-        "Extraction complete: method=%s digital_pages=%d scanned_pages=%d",
-        method, n_digital, n_scanned,
-    )
-
-    # Build OCR quality summary (only meaningful when scanned pages exist)
-    ocr_quality: dict = {}
-    if n_scanned > 0:
-        ocr_sigs = [ps for ps in page_signals if "ocr_avg_confidence" in ps]
-        overall_conf = (
-            round(sum(ps["ocr_avg_confidence"] for ps in ocr_sigs) / len(ocr_sigs), 4)
-            if ocr_sigs else None
-        )
-        ocr_quality = {
-            "render_dpi":              OCR_RENDER_DPI,
-            "confidence_threshold":    OCR_CONFIDENCE_THRESHOLD,
-            "overall_avg_confidence":  overall_conf,
-            "low_confidence_pages":    [p + 1 for p in low_conf_page_indices],
-            "second_pass_page_count":  sum(
-                1 for ps in page_signals if ps.get("ocr_second_pass_used")
-            ),
-        }
-
-    classification = {
-        "is_mixed":           0 < n_scanned < page_count,
-        "digital_page_count": n_digital,
-        "scanned_page_count": n_scanned,
-        "page_modes":         page_modes,
-        "page_signals":       page_signals,
-        "ocr_quality":        ocr_quality,
-        # page_texts is popped in the endpoint before metrics logging to avoid
-        # storing large text blobs in the JSONL record
-        "_page_texts":        page_texts,
-    }
-
-    return "\n\n".join(page_texts), method, page_count, round(time.perf_counter() - t0, 4), classification
-
-
 # ---------------------------------------------------------------------------
-# Document chunking + context budget
+# Chunking + BM25 retrieval
 # ---------------------------------------------------------------------------
 
-def _split_page_into_chunks(page_text: str, page_num: int, max_chars: int) -> list[dict]:
-    """
-    Split one page's text into sub-chunks of at most max_chars.
-    Breaks prefer double-newlines (paragraphs) then single newlines.
-    Each chunk carries page number and part index for labelling in the prompt.
-    """
+def _split_page_into_chunks(
+    page_text: str, page_num: int, max_chars: int
+) -> list[dict]:
     text = page_text.strip()
     if not text:
         return []
+
     if len(text) <= max_chars:
         return [{"page": page_num, "part": 1, "text": text, "char_count": len(text)}]
 
     parts: list[dict] = []
     remaining = text
     part = 1
+
     while remaining:
         if len(remaining) <= max_chars:
-            parts.append({"page": page_num, "part": part, "text": remaining, "char_count": len(remaining)})
+            parts.append(
+                {
+                    "page": page_num,
+                    "part": part,
+                    "text": remaining,
+                    "char_count": len(remaining),
+                }
+            )
             break
+
         cut = max_chars
-        # Try paragraph break first, then line break
-        b = remaining.rfind("\n\n", 0, cut)
-        if b > max_chars // 3:
-            cut = b
-        else:
-            b = remaining.rfind("\n", 0, cut)
-            if b > max_chars // 3:
-                cut = b
+        paragraph_break = remaining.rfind("\n\n", 0, cut)
+        line_break = remaining.rfind("\n", 0, cut)
+
+        if paragraph_break > max_chars // 3:
+            cut = paragraph_break
+        elif line_break > max_chars // 3:
+            cut = line_break
+
         chunk_text = remaining[:cut].rstrip()
         if chunk_text:
-            parts.append({"page": page_num, "part": part, "text": chunk_text, "char_count": len(chunk_text)})
+            parts.append(
+                {
+                    "page": page_num,
+                    "part": part,
+                    "text": chunk_text,
+                    "char_count": len(chunk_text),
+                }
+            )
+
         remaining = remaining[cut:].lstrip()
         part += 1
+
     return parts
 
 
 def chunk_document(page_texts: list[str]) -> list[dict]:
-    """
-    Convert a list of per-page texts into a flat list of chunks.
-    Long pages are split into multiple parts via _split_page_into_chunks.
-    Each chunk: {"page": int, "part": int, "text": str, "char_count": int}.
-    """
     chunks: list[dict] = []
     for i, page_text in enumerate(page_texts):
-        chunks.extend(_split_page_into_chunks(page_text, page_num=i + 1, max_chars=MAX_CHUNK_CHARS))
+        chunks.extend(
+            _split_page_into_chunks(page_text, page_num=i + 1, max_chars=MAX_CHUNK_CHARS)
+        )
     return chunks
 
 
 def select_chunks_within_budget(
-    chunks: list[dict],
-    max_chars: int = MAX_CONTEXT_CHARS,
+    chunks: list[dict], max_chars: int = MAX_CONTEXT_CHARS
 ) -> tuple[list[dict], dict]:
-    """
-    Greedily select chunks from the start until the character budget is exhausted.
-    Returns (selected_chunks, budget_info).
-
-    This is a positional fallback.  Item 5 replaces the selection logic with
-    relevance-ranked retrieval while keeping this function's signature intact.
-    """
     selected: list[dict] = []
     total_chars = 0
+
     for chunk in chunks:
         if total_chars + chunk["char_count"] > max_chars:
             break
         selected.append(chunk)
         total_chars += chunk["char_count"]
 
-    total_pages = chunks[-1]["page"] if chunks else 0
-    last_selected_page = selected[-1]["page"] if selected else 0
+    total_pages = max((c["page"] for c in chunks), default=0)
+    selected_pages = sorted({c["page"] for c in selected})
     was_truncated = len(selected) < len(chunks)
 
     return selected, {
-        "total_chunks":              len(chunks),
-        "selected_chunks":           len(selected),
-        "was_truncated":             was_truncated,
-        "context_chars":             total_chars,
-        "estimated_context_tokens":  total_chars // CHARS_PER_TOKEN,
-        "max_context_tokens":        MAX_CONTEXT_TOKENS,
-        "pages_in_context":          f"1–{last_selected_page}" if was_truncated else f"1–{total_pages}",
-        "pages_omitted":             total_pages - last_selected_page if was_truncated else 0,
+        "total_chunks": len(chunks),
+        "selected_chunks": len(selected),
+        "was_truncated": was_truncated,
+        "context_chars": total_chars,
+        "estimated_context_tokens": total_chars // CHARS_PER_TOKEN,
+        "max_context_tokens": MAX_CONTEXT_TOKENS,
+        "pages_in_context": selected_pages,
+        "pages_omitted": max(total_pages - len(selected_pages), 0) if was_truncated else 0,
     }
 
 
 def _tokenize_for_bm25(text: str) -> list[str]:
-    """
-    Lowercase, strip punctuation, split on whitespace.
-    Used for both the corpus (chunks) and the query (question) so they share
-    the same vocabulary and match on stems like 'total' == 'total:'.
-    """
-    return re.sub(r"[^a-z0-9\s]", " ", text.lower()).split()
+    return re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE).split()
 
 
 def retrieve_relevant_chunks(
-    question: str,
-    chunks: list[dict],
-    top_k: int = BM25_TOP_K,
+    question: str, chunks: list[dict], top_k: int = BM25_TOP_K
 ) -> tuple[list[dict], dict]:
-    """
-    Rank all chunks by BM25 relevance to the question, return the top_k.
-
-    BM25 (Okapi BM25) is a bag-of-words ranking function that weighs term
-    frequency against inverse document frequency.  It finds chunks that share
-    keywords with the question, naturally surfacing the pages most likely to
-    contain the answer — regardless of where they sit in the document.
-
-    Falls back to positional order if rank_bm25 is not installed.
-
-    Returns (ranked_chunks, retrieval_info).
-    Chunks are in RELEVANCE order (highest score first).
-    The caller must re-sort by page number before formatting the prompt.
-    """
     if not chunks:
-        return [], {"method": "none", "reason": "no chunks", "retrieved": 0}
+        return [], {
+            "method": "none",
+            "reason": "no chunks",
+            "retrieved": 0,
+            "total_chunks": 0,
+        }
 
     if not _BM25_AVAILABLE:
-        logger.warning(
-            "rank_bm25 not installed — falling back to positional chunk selection. "
-            "Install with: pip install rank-bm25"
-        )
+        logger.warning("rank_bm25 not installed — falling back to positional selection.")
         fallback = chunks[:top_k]
         return fallback, {
-            "method":       "positional_fallback",
-            "reason":       "rank_bm25 not installed",
-            "top_k":        top_k,
+            "method": "positional_fallback",
+            "reason": "rank_bm25 not installed",
+            "top_k": top_k,
             "total_chunks": len(chunks),
-            "retrieved":    len(fallback),
+            "retrieved": len(fallback),
+            "top_score": 0.0,
+            "min_score": 0.0,
         }
 
     tokenized_corpus = [_tokenize_for_bm25(c["text"]) for c in chunks]
     bm25 = _BM25Okapi(tokenized_corpus)
-
     query_tokens = _tokenize_for_bm25(question)
     scores = bm25.get_scores(query_tokens)
-
-    # Sort by score descending, take top_k
-    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    ranked = [{"bm25_score": round(float(scores[i]), 4), **chunks[i]} for i in ranked_indices]
+    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
+        :top_k
+    ]
+    ranked = [
+        {"bm25_score": round(float(scores[i]), 4), **chunks[i]} for i in ranked_indices
+    ]
 
     return ranked, {
-        "method":      "bm25",
-        "top_k":       top_k,
+        "method": "bm25",
+        "top_k": top_k,
         "total_chunks": len(chunks),
-        "retrieved":   len(ranked),
-        "top_score":   round(float(scores[ranked_indices[0]]), 4) if ranked_indices else 0.0,
-        "min_score":   round(float(scores[ranked_indices[-1]]), 4) if ranked_indices else 0.0,
+        "retrieved": len(ranked),
+        "top_score": round(float(scores[ranked_indices[0]]), 4) if ranked_indices else 0.0,
+        "min_score": round(float(scores[ranked_indices[-1]]), 4) if ranked_indices else 0.0,
     }
 
 
 def format_chunks_for_prompt(chunks: list[dict]) -> str:
-    """
-    Render selected chunks as a labelled string ready for the prompt.
-    Single-part pages get a plain [Page N] header; sub-chunked pages get [Page N, Part M].
-    """
     parts: list[str] = []
     for chunk in chunks:
-        page, part = chunk["page"], chunk.get("part", 1)
+        page = chunk["page"]
+        part = chunk.get("part", 1)
         label = f"[Page {page}]" if part == 1 else f"[Page {page}, Part {part}]"
         parts.append(f"{label}\n{chunk['text']}")
     return "\n\n".join(parts)
@@ -887,10 +563,6 @@ def format_chunks_for_prompt(chunks: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def build_prompt(document_text: str, user_question: str) -> list[dict]:
-    """
-    Build OpenAI-compatible messages for strict, page-aware document extraction.
-    """
-
     system_prompt = (
         "You are a strict document extraction assistant.\n\n"
         "Your task is to answer using ONLY the provided document excerpts.\n\n"
@@ -939,17 +611,13 @@ def build_prompt(document_text: str, user_question: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# LLM streaming
+# LLM calls (Qwen via SGLang)
 # ---------------------------------------------------------------------------
 
 async def query_llm(
-    messages: list[dict],
-    timing: dict,
+    messages: list[dict], timing: dict
 ) -> AsyncGenerator[str, None]:
-    """
-    Stream completion from SGLang (OpenAI-compatible API).
-    Populates `timing` dict in-place with LLM performance metrics.
-    """
+    """Stream a response from the Qwen model. Populates `timing` in-place."""
     t_start = time.perf_counter()
     first_token_s: float | None = None
     output_chars = 0
@@ -969,31 +637,30 @@ async def query_llm(
                 error_text = await response.aread()
                 raise HTTPException(
                     status_code=response.status_code,
-                    detail=f"SGLang error: {error_text.decode()}",
+                    detail=f"SGLang error: {error_text.decode(errors='replace')}",
                 )
 
             async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            if first_token_s is None:
-                                first_token_s = round(time.perf_counter() - t_start, 4)
-                            output_chars += len(content)
-                            yield content
-                    except json.JSONDecodeError:
-                        continue
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        if first_token_s is None:
+                            first_token_s = round(time.perf_counter() - t_start, 4)
+                        output_chars += len(content)
+                        yield content
+                except json.JSONDecodeError:
+                    continue
 
     total_stream_s = round(time.perf_counter() - t_start, 4)
-    est_output_tokens = output_chars // 4
+    est_output_tokens = output_chars // CHARS_PER_TOKEN
     tps = round(est_output_tokens / total_stream_s, 2) if total_stream_s > 0 else 0.0
-
     timing.update(
         {
             "time_to_first_token_s": first_token_s or 0.0,
@@ -1003,6 +670,22 @@ async def query_llm(
             "tokens_per_second": tps,
         }
     )
+
+
+async def _probe_llm(messages: list[dict]) -> str:
+    """Non-streaming call to Qwen — used for the early-exit probe."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            f"{SGLANG_URL}/v1/chat/completions",
+            json={
+                "messages": messages,
+                "stream": False,
+                "max_tokens": MAX_OUTPUT_TOKENS,
+                "temperature": LLM_TEMPERATURE,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -1016,9 +699,9 @@ async def analyze_pdf(
     question: str = Form(..., description="Question to ask about the document"),
 ):
     """
-    Upload a PDF and ask a question about its contents.
-    Returns a streaming response with the LLM's answer.
-    All timing and quality metrics are logged to metrics.jsonl.
+    Upload a PDF and ask a question.
+    Pages are OCR'd by Chandra; the extracted text is reasoned over by Qwen.
+    Returns a streaming response. All metrics are logged to metrics.jsonl.
     """
     request_id: str = getattr(request.state, "request_id", str(uuid.uuid4())[:8])
     t_request_start = time.perf_counter()
@@ -1027,93 +710,183 @@ async def analyze_pdf(
         raise HTTPException(status_code=400, detail="File must be a PDF")
 
     pdf_bytes = await file.read()
-
-    if len(pdf_bytes) == 0:
+    if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file uploaded")
 
-    try:
-        document_text, extraction_method, page_count, extraction_time_s, pdf_classification = (
-            extract_text_from_pdf(pdf_bytes)
+    pdf_key = _pdf_hash(pdf_bytes)
+    logger.info(
+        "[req=%s] Uploaded PDF filename=%s size=%d bytes hash=%s",
+        request_id,
+        file.filename,
+        len(pdf_bytes),
+        pdf_key[:12],
+    )
+
+    cached = _cache_get(pdf_key)
+
+    if cached is not None:
+        logger.info(
+            "[req=%s] Cache hit for PDF %s… skipping extraction", request_id, pdf_key[:12]
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to extract PDF text: {e}")
+        document_text = cached["document_text"]
+        extraction_method = cached["extraction_method"]
+        page_count = cached["page_count"]
+        extraction_time_s = 0.0
+        pdf_classification = copy.deepcopy(cached["pdf_classification"])
+    else:
+        try:
+            (
+                document_text,
+                extraction_method,
+                page_count,
+                extraction_time_s,
+                pdf_classification,
+            ) = await extract_text_with_chandra_api(pdf_bytes, file.filename)
+        except Exception as exc:
+            logger.exception("[req=%s] Failed to extract PDF text", request_id)
+            raise HTTPException(
+                status_code=400, detail=f"Failed to extract PDF text: {exc}"
+            ) from exc
+
+        _cache_put(
+            pdf_key,
+            {
+                "document_text": document_text,
+                "extraction_method": extraction_method,
+                "page_count": page_count,
+                "extraction_time_s": extraction_time_s,
+                "pdf_classification": copy.deepcopy(pdf_classification),
+            },
+        )
+        logger.info(
+            "[req=%s] Extraction complete — cached as %s…", request_id, pdf_key[:12]
+        )
 
     if not document_text.strip():
         raise HTTPException(
-            status_code=400,
-            detail="No text could be extracted from the PDF",
+            status_code=400, detail="No text could be extracted from the PDF"
         )
 
-    # --- Chunking → BM25 retrieval → context budget ---
-    # Pop page_texts before metrics logging (avoid storing large blobs in JSONL)
-    page_texts_list: list[str] = pdf_classification.pop("_page_texts", [document_text])
-
-    chunks = chunk_document(page_texts_list)
-
-    # Item 9 — dynamic token budget: shrink document context to fit the full
-    # conversation (system prompt + question + output reserve) within MAX_TOTAL_TOKENS.
-    _sys_chars      = len(build_prompt("", "")[0]["content"])
-    _question_chars = len(question)
-    _output_reserve = MAX_OUTPUT_TOKENS * CHARS_PER_TOKEN
-    doc_budget_chars = max(
-        MAX_TOTAL_TOKENS * CHARS_PER_TOKEN - _sys_chars - _question_chars - _output_reserve,
-        2000,   # floor: always allow at least a small context window
+    page_texts_list: list[str] = (
+        pdf_classification.get("_page_texts") or document_text.split("\n\n")
     )
 
-    # Rank all chunks by relevance to the question
-    ranked_chunks, retrieval_info = retrieve_relevant_chunks(question, chunks)
+    if len(page_texts_list) != page_count:
+        logger.warning(
+            "[req=%s] Page text count mismatch: page_texts=%d pdf_pages=%d.",
+            request_id,
+            len(page_texts_list),
+            page_count,
+        )
 
-    # Apply dynamic token budget — fills with the most relevant chunks first
+    print(f"\n{'=' * 70}")
+    print(
+        f"[EXTRACTION] req={request_id}  method={extraction_method}"
+        f"  pages={len(page_texts_list)}  pdf_pages={page_count}"
+    )
+    print(f"{'=' * 70}")
+    for page_num, page_text in enumerate(page_texts_list, start=1):
+        print(f"\n--- Page {page_num} ({len(page_text)} chars) ---")
+        print(page_text[:2000] + (" …[truncated]" if len(page_text) > 2000 else ""))
+    print(f"\n{'=' * 70}  END EXTRACTION  {'=' * 70}\n")
+
+    chunks = chunk_document(page_texts_list)
+    if not chunks:
+        raise HTTPException(
+            status_code=400, detail="Extracted text is empty after chunking"
+        )
+
+    system_chars = len(build_prompt("", "")[0]["content"])
+    question_chars = len(question)
+    output_reserve_chars = MAX_OUTPUT_TOKENS * CHARS_PER_TOKEN
+    doc_budget_chars = max(
+        MAX_TOTAL_TOKENS * CHARS_PER_TOKEN
+        - system_chars
+        - question_chars
+        - output_reserve_chars,
+        2000,
+    )
+
+    ranked_chunks, retrieval_info = retrieve_relevant_chunks(question, chunks)
     selected_chunks, budget_info = select_chunks_within_budget(
         ranked_chunks, max_chars=doc_budget_chars
     )
-
-    # Re-sort selected chunks into document (page) order so the context reads
-    # coherently: the model sees page 3 before page 24, not relevance order
     selected_chunks_ordered = sorted(
         selected_chunks, key=lambda c: (c["page"], c.get("part", 1))
     )
 
-    if budget_info["was_truncated"]:
-        logger.info(
-            "[req=%s] BM25 retrieved %d/%d chunks; %d fit budget (%s of %d pages). "
-            "Low-relevance chunks omitted.",
-            request_id,
-            retrieval_info["retrieved"],
-            retrieval_info["total_chunks"],
-            budget_info["selected_chunks"],
-            budget_info["pages_in_context"],
-            page_count,
+    logger.info(
+        "[req=%s] Retrieval method=%s retrieved=%d selected=%d chunks",
+        request_id,
+        retrieval_info.get("method"),
+        retrieval_info.get("retrieved", 0),
+        budget_info.get("selected_chunks", 0),
+    )
+
+    early_exit_answer: str | None = None
+    early_exit_chunks_used = 0
+    early_exit_probe_s = 0.0
+    early_exit_budget_info: dict = {}
+
+    top_score = (
+        ranked_chunks[0].get("bm25_score", 0.0)
+        if ranked_chunks and _BM25_AVAILABLE
+        else 0.0
+    )
+
+    if EARLY_EXIT_TOP_K > 0 and ranked_chunks and top_score >= EARLY_EXIT_BM25_THRESHOLD:
+        probe_chunks = ranked_chunks[:EARLY_EXIT_TOP_K]
+        probe_chunks_ordered = sorted(
+            probe_chunks, key=lambda c: (c["page"], c.get("part", 1))
         )
-    else:
-        logger.info(
-            "[req=%s] BM25 retrieved %d relevant chunks — all fit budget.",
-            request_id,
-            retrieval_info["retrieved"],
-        )
+        probe_context = format_chunks_for_prompt(probe_chunks_ordered)
+        probe_messages = build_prompt(probe_context, question)
+
+        t_probe = time.perf_counter()
+        try:
+            probe_answer = await _probe_llm(probe_messages)
+            early_exit_probe_s = round(time.perf_counter() - t_probe, 4)
+
+            if "NOT FOUND" not in probe_answer.upper():
+                early_exit_answer = probe_answer
+                early_exit_chunks_used = len(probe_chunks)
+                probe_chars = sum(c["char_count"] for c in probe_chunks)
+                early_exit_budget_info = {
+                    "total_chunks": len(chunks),
+                    "selected_chunks": early_exit_chunks_used,
+                    "was_truncated": early_exit_chunks_used < len(chunks),
+                    "context_chars": probe_chars,
+                    "estimated_context_tokens": probe_chars // CHARS_PER_TOKEN,
+                    "pages_in_context": sorted({c["page"] for c in probe_chunks}),
+                }
+                logger.info(
+                    "[req=%s] Early exit: answer found in top %d chunk(s), score=%.2f",
+                    request_id,
+                    early_exit_chunks_used,
+                    top_score,
+                )
+        except Exception as exc:
+            early_exit_probe_s = round(time.perf_counter() - t_probe, 4)
+            logger.warning("[req=%s] Early exit probe failed: %s", request_id, exc)
 
     context_text = format_chunks_for_prompt(selected_chunks_ordered)
     messages = build_prompt(context_text, question)
-
-    # Estimate prompt size (rough: 1 token ≈ 4 chars)
     prompt_chars = sum(len(m["content"]) for m in messages)
-    est_prompt_tokens = prompt_chars // 4
+    est_prompt_tokens = prompt_chars // CHARS_PER_TOKEN
 
-    llm_timing: dict = {}
-    collected_output: list[str] = []
-
-    async def timed_stream():
-        async for chunk in query_llm(messages, llm_timing):
-            collected_output.append(chunk)
-            yield chunk
-
-        # Stream is done — build and log the full metrics record
-        full_output = "".join(collected_output)
-        total_request_s = round(time.perf_counter() - t_request_start, 4)
-
+    def _log_metrics(
+        full_output: str,
+        total_request_s: float,
+        llm_timing: dict,
+        *,
+        early_exit: bool,
+    ) -> None:
         ttft = llm_timing.get("time_to_first_token_s", 0.0)
         est_prompt_tok = est_prompt_tokens or 1
         answer_latency_per_input_token_ms = round((ttft * 1000) / est_prompt_tok, 4)
+
+        pdf_classification_for_metrics = copy.deepcopy(pdf_classification)
+        pdf_classification_for_metrics.pop("_page_texts", None)
 
         record = {
             "request_id": request_id,
@@ -1125,7 +898,7 @@ async def analyze_pdf(
                 "extraction_method": extraction_method,
                 "extraction_time_s": extraction_time_s,
                 "text_chars": len(document_text),
-                "classification": pdf_classification,
+                "classification": pdf_classification_for_metrics,
             },
             "prompt": {
                 "question": question,
@@ -1133,16 +906,21 @@ async def analyze_pdf(
                 "total_prompt_chars": prompt_chars,
                 "estimated_prompt_tokens": est_prompt_tokens,
                 "retrieval": retrieval_info,
-                "context_budget": budget_info,
+                "context_budget": early_exit_budget_info if early_exit else budget_info,
             },
             "model": {
-                "id": _active_model,
+                "reasoning_model": _active_model,
+                "ocr_model": _chandra_model,
                 "temperature": LLM_TEMPERATURE,
                 "max_tokens": MAX_OUTPUT_TOKENS,
                 "sglang_url": SGLANG_URL,
+                "chandra_url": CHANDRA_URL,
             },
             "performance": {
                 "extraction_time_s": extraction_time_s,
+                "early_exit": early_exit,
+                "early_exit_chunks_used": early_exit_chunks_used if early_exit else 0,
+                "early_exit_probe_s": early_exit_probe_s,
                 "time_to_first_token_s": llm_timing.get("time_to_first_token_s", 0.0),
                 "total_stream_time_s": llm_timing.get("total_stream_time_s", 0.0),
                 "total_request_time_s": total_request_s,
@@ -1153,8 +931,7 @@ async def analyze_pdf(
             "quality_signals": {
                 "response_empty": len(full_output.strip()) == 0,
                 "said_not_found": (
-                    "not found:" in full_output.lower()
-                    or "cannot be found" in full_output.lower()
+                    full_output.strip().upper() == "NOT FOUND"
                     or "not found in the document" in full_output.lower()
                     or "do not contain sufficient" in full_output.lower()
                 ),
@@ -1164,15 +941,57 @@ async def analyze_pdf(
 
         _append_metric(record)
         perf_logger.info(
-            "[req=%s] ttft=%.3fs tps=%.1f tokens=%d total=%.3fs model=%s method=%s",
+            "[req=%s] ttft=%.3fs tps=%.1f tokens=%d total=%.3fs"
+            " ocr=%s reasoning=%s%s",
             request_id,
             record["performance"]["time_to_first_token_s"],
             record["performance"]["tokens_per_second"],
             record["performance"]["estimated_output_tokens"],
             total_request_s,
+            _chandra_model,
             _active_model,
-            extraction_method,
+            " [early-exit]" if early_exit else "",
         )
+
+    if early_exit_answer is not None:
+        stream_chunk_size = 32
+
+        async def early_stream():
+            t0 = time.perf_counter()
+            output = early_exit_answer or ""
+            for i in range(0, len(output), stream_chunk_size):
+                yield output[i : i + stream_chunk_size]
+            total_request_s = round(time.perf_counter() - t_request_start, 4)
+            stream_s = round(time.perf_counter() - t0, 4)
+            out_chars = len(output)
+            est_out_tok = out_chars // CHARS_PER_TOKEN
+            _log_metrics(
+                output,
+                total_request_s,
+                {
+                    "time_to_first_token_s": early_exit_probe_s,
+                    "total_stream_time_s": stream_s,
+                    "output_chars": out_chars,
+                    "estimated_output_tokens": est_out_tok,
+                    "tokens_per_second": round(est_out_tok / stream_s, 2)
+                    if stream_s > 0
+                    else 0.0,
+                },
+                early_exit=True,
+            )
+
+        return StreamingResponse(early_stream(), media_type="text/plain")
+
+    llm_timing: dict = {}
+    collected_output: list[str] = []
+
+    async def timed_stream():
+        async for chunk in query_llm(messages, llm_timing):
+            collected_output.append(chunk)
+            yield chunk
+        full_output = "".join(collected_output)
+        total_request_s = round(time.perf_counter() - t_request_start, 4)
+        _log_metrics(full_output, total_request_s, llm_timing, early_exit=False)
 
     return StreamingResponse(timed_stream(), media_type="text/plain")
 
@@ -1183,10 +1002,7 @@ async def analyze_pdf(
 
 @app.get("/stats")
 async def get_stats():
-    """
-    Aggregate performance stats from the metrics.jsonl log.
-    Returns per-model summaries, slowest/fastest prompts, and method breakdown.
-    """
+    """Aggregate performance stats from the metrics.jsonl log."""
     if not METRICS_LOG_PATH.exists():
         return JSONResponse({"error": "No metrics recorded yet."}, status_code=404)
 
@@ -1194,39 +1010,56 @@ async def get_stats():
     with METRICS_LOG_PATH.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
     if not records:
         return JSONResponse({"error": "Metrics file is empty."}, status_code=404)
 
-    total = len(records)
+    def _avg(values: list[float]) -> float:
+        return round(sum(values) / len(values), 4) if values else 0.0
 
-    ttfts = [r["performance"]["time_to_first_token_s"] for r in records]
-    tpss = [r["performance"]["tokens_per_second"] for r in records if r["performance"]["tokens_per_second"] > 0]
-    total_times = [r["performance"]["total_request_time_s"] for r in records]
+    total = len(records)
+    ttfts = [r["performance"].get("time_to_first_token_s", 0.0) for r in records]
+    tpss = [
+        r["performance"].get("tokens_per_second", 0.0)
+        for r in records
+        if r["performance"].get("tokens_per_second", 0.0) > 0
+    ]
+    total_times = [r["performance"].get("total_request_time_s", 0.0) for r in records]
+    extraction_times = [r["performance"].get("extraction_time_s", 0.0) for r in records]
 
     method_counts: dict[str, int] = {}
-    model_counts: dict[str, int] = {}
+    reasoning_model_counts: dict[str, int] = {}
+    ocr_model_counts: dict[str, int] = {}
     for r in records:
-        m = r["pdf"]["extraction_method"]
-        method_counts[m] = method_counts.get(m, 0) + 1
-        mid = r["model"]["id"]
-        model_counts[mid] = model_counts.get(mid, 0) + 1
+        method = r.get("pdf", {}).get("extraction_method", "unknown")
+        method_counts[method] = method_counts.get(method, 0) + 1
+        rm = r.get("model", {}).get("reasoning_model") or r.get("model", {}).get(
+            "id", "unknown"
+        )
+        reasoning_model_counts[rm] = reasoning_model_counts.get(rm, 0) + 1
+        om = r.get("model", {}).get("ocr_model", "unknown")
+        ocr_model_counts[om] = ocr_model_counts.get(om, 0) + 1
 
-    said_not_found = sum(1 for r in records if r["quality_signals"]["said_not_found"])
-    empty_responses = sum(1 for r in records if r["quality_signals"]["response_empty"])
+    said_not_found = sum(
+        1
+        for r in records
+        if r.get("quality_signals", {}).get("said_not_found", False)
+    )
+    empty_responses = sum(
+        1 for r in records if r.get("quality_signals", {}).get("response_empty", False)
+    )
 
-    # Slowest and fastest by TTFT
-    sorted_by_ttft = sorted(records, key=lambda r: r["performance"]["time_to_first_token_s"])
+    sorted_by_ttft = sorted(
+        records, key=lambda r: r["performance"].get("time_to_first_token_s", 0.0)
+    )
     fastest = sorted_by_ttft[0]
     slowest = sorted_by_ttft[-1]
-
-    def _avg(lst: list[float]) -> float:
-        return round(sum(lst) / len(lst), 4) if lst else 0.0
 
     return {
         "total_requests": total,
@@ -1234,29 +1067,35 @@ async def get_stats():
             "time_to_first_token_s": _avg(ttfts),
             "tokens_per_second": _avg(tpss),
             "total_request_time_s": _avg(total_times),
+            "extraction_time_s": _avg(extraction_times),
         },
         "extraction_methods": method_counts,
-        "models_used": model_counts,
+        "reasoning_models_used": reasoning_model_counts,
+        "ocr_models_used": ocr_model_counts,
         "quality": {
             "said_not_found_count": said_not_found,
             "empty_response_count": empty_responses,
             "said_not_found_pct": round(said_not_found / total * 100, 1),
         },
         "fastest_prompt": {
-            "request_id": fastest["request_id"],
-            "question": fastest["prompt"]["question"],
-            "time_to_first_token_s": fastest["performance"]["time_to_first_token_s"],
-            "tokens_per_second": fastest["performance"]["tokens_per_second"],
-            "model": fastest["model"]["id"],
-            "extraction_method": fastest["pdf"]["extraction_method"],
+            "request_id": fastest.get("request_id"),
+            "question": fastest.get("prompt", {}).get("question"),
+            "time_to_first_token_s": fastest.get("performance", {}).get(
+                "time_to_first_token_s"
+            ),
+            "tokens_per_second": fastest.get("performance", {}).get("tokens_per_second"),
+            "reasoning_model": fastest.get("model", {}).get("reasoning_model"),
+            "ocr_model": fastest.get("model", {}).get("ocr_model"),
         },
         "slowest_prompt": {
-            "request_id": slowest["request_id"],
-            "question": slowest["prompt"]["question"],
-            "time_to_first_token_s": slowest["performance"]["time_to_first_token_s"],
-            "tokens_per_second": slowest["performance"]["tokens_per_second"],
-            "model": slowest["model"]["id"],
-            "extraction_method": slowest["pdf"]["extraction_method"],
+            "request_id": slowest.get("request_id"),
+            "question": slowest.get("prompt", {}).get("question"),
+            "time_to_first_token_s": slowest.get("performance", {}).get(
+                "time_to_first_token_s"
+            ),
+            "tokens_per_second": slowest.get("performance", {}).get("tokens_per_second"),
+            "reasoning_model": slowest.get("model", {}).get("reasoning_model"),
+            "ocr_model": slowest.get("model", {}).get("ocr_model"),
         },
     }
 
@@ -1267,35 +1106,62 @@ async def get_stats():
 
 @app.get("/health")
 async def health_check():
-    """Check if the server and SGLang backend are healthy."""
+    """Check both Chandra OCR and Qwen/SGLang backend health."""
+    global _active_model, _chandra_model
+
     sglang_status = "unknown"
     sglang_models: list[str] = []
+    chandra_status = "unknown"
+    chandra_models: list[str] = []
 
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{SGLANG_URL}/v1/models")
-            if response.status_code == 200:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            resp = await client.get(f"{SGLANG_URL}/v1/models")
+            if resp.status_code == 200:
                 sglang_status = "healthy"
-                data = response.json()
-                sglang_models = [m.get("id") for m in data.get("data", [])]
-                # Keep the cached model name up to date
-                global _active_model
+                data = resp.json()
+                sglang_models = [m.get("id") for m in data.get("data", []) if m.get("id")]
                 if sglang_models:
                     _active_model = sglang_models[0]
             else:
-                sglang_status = f"error: {response.status_code}"
-    except httpx.ConnectError:
-        sglang_status = "unreachable"
-    except Exception as e:
-        sglang_status = f"error: {str(e)}"
+                sglang_status = f"error: {resp.status_code}"
+        except httpx.ConnectError:
+            sglang_status = "unreachable"
+        except Exception as exc:
+            sglang_status = f"error: {exc}"
+
+        try:
+            resp = await client.get(f"{CHANDRA_URL}/v1/models")
+            if resp.status_code == 200:
+                chandra_status = "healthy"
+                data = resp.json()
+                chandra_models = [
+                    m.get("id") for m in data.get("data", []) if m.get("id")
+                ]
+                if chandra_models:
+                    _chandra_model = chandra_models[0]
+            else:
+                chandra_status = f"error: {resp.status_code}"
+        except httpx.ConnectError:
+            chandra_status = "unreachable"
+        except Exception as exc:
+            chandra_status = f"error: {exc}"
 
     return {
         "status": "healthy",
-        "active_model": _active_model,
-        "sglang": {
-            "url": SGLANG_URL,
-            "status": sglang_status,
-            "models": sglang_models,
+        "services": {
+            "chandra_ocr": {
+                "url": CHANDRA_URL,
+                "status": chandra_status,
+                "model": _chandra_model,
+                "models": chandra_models,
+            },
+            "qwen_reasoning": {
+                "url": SGLANG_URL,
+                "status": sglang_status,
+                "model": _active_model,
+                "models": sglang_models,
+            },
         },
     }
 
