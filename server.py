@@ -13,6 +13,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import html as html_lib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
+from html.parser import HTMLParser
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -265,8 +267,9 @@ async def _ocr_page_with_chandra(
                     {
                         "type": "text",
                         "text": (
-                            "Convert this document page to markdown. "
-                            "Preserve all text, tables, headings, and layout. "
+                            "Extract all text from this document page as plain text "
+                            "or markdown. Preserve tables, headings, and reading order. "
+                            "Do not wrap content in HTML tags or bounding-box markup. "
                             "Output only the extracted content — no commentary."
                         ),
                     },
@@ -332,7 +335,7 @@ async def extract_text_with_chandra_api(
             )
         )
 
-    page_texts = [clean_page_text(t) for t in page_texts]
+    page_texts = [normalize_page_text(t) for t in page_texts]
     page_texts = deduplicate_headers_footers(page_texts)
 
     document_text = "\n\n".join(pt for pt in page_texts if pt)
@@ -364,8 +367,63 @@ async def extract_text_with_chandra_api(
 
 
 # ---------------------------------------------------------------------------
-# Text post-processing (applied to Chandra markdown output)
+# Text post-processing (applied to Chandra markdown / HTML output)
 # ---------------------------------------------------------------------------
+
+_BLOCK_END_TAGS = frozenset(
+    {"p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody"}
+)
+_CELL_TAGS = frozenset({"td", "th"})
+
+
+class _HTMLPlainTextParser(HTMLParser):
+    """Best-effort HTML → plain text (handles Chandra bbox markup)."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "br":
+            self._parts.append("\n")
+        elif tag == "tr":
+            self._parts.append("\n")
+        elif tag in _CELL_TAGS:
+            self._parts.append("\t")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _BLOCK_END_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self._parts.append(data)
+
+    def plain_text(self) -> str:
+        return "".join(self._parts)
+
+
+def html_to_plain_text(text: str) -> str:
+    """Strip HTML tags and bbox wrappers; preserve line/table structure."""
+    if not text or "<" not in text:
+        return text
+
+    parser = _HTMLPlainTextParser()
+    try:
+        parser.feed(text)
+        parser.close()
+        plain = parser.plain_text()
+    except Exception:
+        plain = re.sub(r"<[^>]+>", " ", text)
+
+    plain = html_lib.unescape(plain)
+    plain = plain.replace("\r\n", "\n").replace("\r", "\n")
+    plain = re.sub(r"[ \t]+\n", "\n", plain)
+    plain = re.sub(r"\n[ \t]+", "\n", plain)
+    plain = re.sub(r"[ \t]{2,}", " ", plain)
+    plain = re.sub(r"\n{3,}", "\n\n", plain)
+    return plain.strip()
+
 
 def clean_page_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -374,6 +432,11 @@ def clean_page_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     lines = [line.strip() for line in text.split("\n")]
     return "\n".join(lines).strip()
+
+
+def normalize_page_text(text: str) -> str:
+    """HTML/plain cleanup used for chunking and LLM context (incl. cached OCR)."""
+    return clean_page_text(html_to_plain_text(text))
 
 
 def deduplicate_headers_footers(
@@ -564,30 +627,26 @@ def format_chunks_for_prompt(chunks: list[dict]) -> str:
 
 def build_prompt(document_text: str, user_question: str) -> list[dict]:
     system_prompt = (
-        "You are a strict document extraction assistant.\n\n"
-        "Your task is to answer using ONLY the provided document excerpts.\n\n"
-        "Follow these rules exactly:\n"
-        "1. Use only the provided text. Do not use outside knowledge.\n"
-        "2. Do not guess or infer missing information.\n"
-        "3. Respect page boundaries strictly:\n"
-        "   - If a page number is mentioned in the question, use ONLY that page.\n"
-        "   - Never include content from other pages.\n"
-        "4. Prefer exact extraction over summarization:\n"
-        "   - Extract items exactly as written.\n"
-        "   - Preserve wording, order, and structure.\n"
-        "   - Do NOT rephrase, translate, or normalize.\n"
-        "5. For list questions:\n"
-        "   - Return ONLY a clean bullet list.\n"
-        "   - No explanations, no headings, no extra text.\n"
-        "6. For table data:\n"
-        "   - Preserve row-level meaning.\n"
-        "   - Do not mix values from different rows.\n"
-        "7. If the answer is not explicitly present, return exactly:\n"
-        "   NOT FOUND\n"
-        "8. Do not explain your reasoning.\n"
-        "9. Do not mention page numbers in the output unless explicitly asked.\n\n"
-        "Priority:\n"
-        "Exactness > Completeness > Fluency"
+        "You are a document Q&A assistant.\n\n"
+        "Answer using ONLY the provided document excerpts.\n\n"
+        "Rules:\n"
+        "1. Ground every answer in the excerpts. Do not use outside knowledge.\n"
+        "2. Map question terms to document content when the meaning is clear:\n"
+        "   - patient / recipient / addressee → person named in the address block\n"
+        "   - insurance / member / policy numbers → labels such as Versichertennummer, "
+        "Vers.-Nr., Krankenversichertennummer, KVNR, IK, Mitgliedsnummer\n"
+        "3. For names and addresses, combine consecutive lines as written "
+        "(e.g. Frau + Rita Merker → Frau Rita Merker).\n"
+        "4. For specific field requests: return the value as written in the document "
+        "(keep the original language).\n"
+        "5. For summary questions (e.g. what is this document about): one short factual "
+        "sentence from the document type, title, and visible purpose.\n"
+        "6. For lists: return only a bullet list using exact wording from the document.\n"
+        "7. For tables: preserve row-level meaning; do not mix values across rows.\n"
+        "8. If the question names a page number, use only that page.\n"
+        "9. Return NOT FOUND only when the requested information is genuinely absent "
+        "from all excerpts (not merely under a different label).\n"
+        "10. Do not explain your reasoning. Do not mention page numbers unless asked."
     )
 
     user_content = (
@@ -598,10 +657,9 @@ def build_prompt(document_text: str, user_question: str) -> list[dict]:
         f"{user_question}\n\n"
         "---\n\n"
         "## Instructions\n"
-        "Return the answer exactly in the format requested.\n"
-        "If the question mentions a specific page, use only that page.\n"
-        "If listing items, extract them exactly as written and in order.\n"
-        "If not found, return: NOT FOUND"
+        "Answer concisely in the format implied by the question.\n"
+        "Use exact values from the excerpts when extracting fields.\n"
+        "If the information is not in the excerpts, return exactly: NOT FOUND"
     )
 
     return [
@@ -770,6 +828,7 @@ async def analyze_pdf(
     page_texts_list: list[str] = (
         pdf_classification.get("_page_texts") or document_text.split("\n\n")
     )
+    page_texts_list = [normalize_page_text(t) for t in page_texts_list]
 
     if len(page_texts_list) != page_count:
         logger.warning(
