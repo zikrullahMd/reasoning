@@ -7,7 +7,8 @@ FastAPI server that:
 3. Retrieves relevant chunks using BM25 with context-budget management
 4. Streams reasoning responses from Qwen via SGLang/vLLM
 5. Rewrites selected text via POST /rephrase (style + language)
-6. Logs structured performance metrics to metrics.jsonl
+6. Streams general chat via POST /prompt
+7. Logs structured performance metrics to metrics.jsonl
 """
 
 import asyncio
@@ -89,6 +90,16 @@ REPHRASE_MAX_INSTRUCTION_CHARS = int(
 REPHRASE_MAX_TOKENS = int(os.getenv("REPHRASE_MAX_TOKENS", "1024"))
 REPHRASE_TEMPERATURE = float(os.getenv("REPHRASE_TEMPERATURE", "0.3"))
 REPHRASE_TIMEOUT_S = float(os.getenv("REPHRASE_TIMEOUT_S", "60"))
+
+# Chat prompt endpoint
+PROMPT_MAX_INPUT_CHARS = int(os.getenv("PROMPT_MAX_INPUT_CHARS", "8000"))
+PROMPT_MAX_HISTORY_TURNS = int(os.getenv("PROMPT_MAX_HISTORY_TURNS", "20"))
+CHAT_TEMPERATURE = float(os.getenv("CHAT_TEMPERATURE", "0.7"))
+CHAT_SYSTEM_PROMPT = os.getenv(
+    "CHAT_SYSTEM_PROMPT",
+    "You are a helpful, knowledgeable assistant. Answer clearly and concisely. "
+    "If you don't know something, say so.",
+)
 
 RephraseStyle = Literal[
     "formal",
@@ -805,12 +816,27 @@ def build_prompt(document_text: str, user_question: str) -> list[dict]:
     ]
 
 
+def build_chat_messages(
+    user_message: str,
+    history: list[dict] | None = None,
+) -> list[dict]:
+    messages: list[dict] = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+    return messages
+
+
 # ---------------------------------------------------------------------------
 # LLM calls (Qwen via SGLang)
 # ---------------------------------------------------------------------------
 
 async def query_llm(
-    messages: list[dict], timing: dict
+    messages: list[dict],
+    timing: dict,
+    *,
+    max_tokens: int = MAX_OUTPUT_TOKENS,
+    temperature: float = LLM_TEMPERATURE,
 ) -> AsyncGenerator[str, None]:
     """Stream a response from the Qwen model. Populates `timing` in-place."""
     t_start = time.perf_counter()
@@ -824,8 +850,8 @@ async def query_llm(
             json={
                 "messages": messages,
                 "stream": True,
-                "max_tokens": MAX_OUTPUT_TOKENS,
-                "temperature": LLM_TEMPERATURE,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
             },
         ) as response:
             if response.status_code != 200:
@@ -935,6 +961,17 @@ class RephraseResponse(BaseModel):
     text: str
 
 
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1)
+
+
+class PromptRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    history: list[ChatHistoryMessage] = Field(default_factory=list)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+
+
 class RephraseStyleItem(BaseModel):
     id: str
     label_de: str
@@ -1021,6 +1058,70 @@ async def list_rephrase_styles():
             for style_id in REPHRASE_STYLES
         ]
     )
+
+# ---------------------------------------------------------------------------
+# Prompt endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/prompt")
+async def prompt_chat(request: Request, body: PromptRequest):
+    """
+    Chat with the LLM. Send a message and receive a streaming text response.
+    Optional history enables multi-turn conversation.
+    """
+    request_id: str = getattr(request.state, "request_id", str(uuid.uuid4())[:8])
+    t_start = time.perf_counter()
+
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message must not be empty")
+    if len(message) > PROMPT_MAX_INPUT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"message exceeds maximum length of {PROMPT_MAX_INPUT_CHARS} characters"
+            ),
+        )
+    if len(body.history) > PROMPT_MAX_HISTORY_TURNS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"history exceeds maximum of {PROMPT_MAX_HISTORY_TURNS} turns",
+        )
+
+    history = [{"role": m.role, "content": m.content.strip()} for m in body.history]
+    messages = build_chat_messages(message, history)
+    temperature = body.temperature if body.temperature is not None else CHAT_TEMPERATURE
+    llm_timing: dict = {}
+
+    async def stream():
+        async for chunk in query_llm(messages, llm_timing, temperature=temperature):
+            yield chunk
+        elapsed = round(time.perf_counter() - t_start, 4)
+        logger.info(
+            "[req=%s] POST /prompt history=%d in=%d out=%d ttft=%.3fs total=%.3fs",
+            request_id,
+            len(body.history),
+            len(message),
+            llm_timing.get("output_chars", 0),
+            llm_timing.get("time_to_first_token_s", 0.0),
+            elapsed,
+        )
+        _append_metric(
+            {
+                "request_id": request_id,
+                "endpoint": "prompt",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "input_chars": len(message),
+                "history_turns": len(body.history),
+                "output_chars": llm_timing.get("output_chars", 0),
+                "latency_s": elapsed,
+                "temperature": temperature,
+                "model": _active_model,
+                "performance": llm_timing,
+            }
+        )
+
+    return StreamingResponse(stream(), media_type="text/plain")
 
 
 @app.post("/rephrase", response_model=RephraseResponse)
