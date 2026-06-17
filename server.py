@@ -8,7 +8,8 @@ FastAPI server that:
 4. Streams reasoning responses from Qwen via SGLang/vLLM
 5. Rewrites selected text via POST /rephrase (style + language)
 6. Streams general chat via POST /prompt
-7. Logs structured performance metrics to metrics.jsonl
+7. Extracts structured fields from eGK uploads via POST /extract-id (file_front + file_back)
+8. Logs structured performance metrics to metrics.jsonl
 """
 
 import asyncio
@@ -34,7 +35,7 @@ from typing import AsyncGenerator, Literal
 import fitz  # PyMuPDF — used only for PDF → PNG rendering
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -100,6 +101,12 @@ CHAT_SYSTEM_PROMPT = os.getenv(
     "You are a helpful, knowledgeable assistant. Answer clearly and concisely. "
     "If you don't know something, say so.",
 )
+
+# eGK ID extraction endpoint
+EXTRACT_ID_MAX_TOKENS = int(os.getenv("EXTRACT_ID_MAX_TOKENS", "2048"))
+EXTRACT_ID_TEMPERATURE = float(os.getenv("EXTRACT_ID_TEMPERATURE", "0.0"))
+EXTRACT_ID_TIMEOUT_S = float(os.getenv("EXTRACT_ID_TIMEOUT_S", "60"))
+EXTRACT_ID_OCR_TIMEOUT_S = float(os.getenv("EXTRACT_ID_OCR_TIMEOUT_S", "120"))
 
 RephraseStyle = Literal[
     "formal",
@@ -352,7 +359,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PDF Inference Pipeline",
-    description="Upload PDFs and ask questions — Chandra OCR + Qwen reasoning + text rephrase",
+    description=(
+        "Upload PDFs and ask questions — Chandra OCR + Qwen reasoning + text rephrase "
+        "+ eGK field extraction"
+    ),
     version="2.1.0",
     lifespan=lifespan,
 )
@@ -397,6 +407,8 @@ async def _ocr_page_with_chandra(
     b64_image: str,
     page_num: int,
     client: httpx.AsyncClient,
+    *,
+    mime_type: str = "image/png",
 ) -> str:
     """
     Send one page image to the Chandra OCR vLLM server via /v1/chat/completions
@@ -410,7 +422,7 @@ async def _ocr_page_with_chandra(
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                        "image_url": {"url": f"data:{mime_type};base64,{b64_image}"},
                     },
                     {
                         "type": "text",
@@ -512,6 +524,106 @@ async def extract_text_with_chandra_api(
     }
 
     return document_text, "chandra_api", page_count, elapsed, classification
+
+
+_ALLOWED_ID_MIME: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".pdf": "application/pdf",
+}
+
+
+def _pdf_first_page_to_png(pdf_bytes: bytes) -> bytes:
+    """Render the first page of a PDF to PNG bytes for Chandra OCR."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if len(doc) == 0:
+        doc.close()
+        raise ValueError("PDF has no pages")
+    png_bytes = _render_page_to_png_bytes(doc[0], CHANDRA_OCR_DPI)
+    doc.close()
+    return png_bytes
+
+
+def _prepare_egk_upload(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+    """
+    Normalize an uploaded eGK file to raw image bytes + MIME type for Chandra.
+
+    JPEG/PNG are passed through. PDF is rasterized to PNG via PyMuPDF.
+    """
+    ext = Path(filename).suffix.lower()
+    if ext not in _ALLOWED_ID_MIME:
+        raise ValueError("File must be JPG, JPEG, PNG, or PDF")
+
+    if ext == ".pdf":
+        return _pdf_first_page_to_png(file_bytes), "image/png"
+
+    return file_bytes, _ALLOWED_ID_MIME[ext]
+
+
+async def ocr_egk_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
+    """Run Chandra OCR on a single eGK image."""
+    b64 = base64.b64encode(image_bytes).decode()
+    async with httpx.AsyncClient(timeout=EXTRACT_ID_OCR_TIMEOUT_S) as client:
+        raw = await _ocr_page_with_chandra(b64, page_num=1, client=client, mime_type=mime_type)
+    return normalize_page_text(raw)
+
+
+async def _read_egk_side(upload: UploadFile, side: str) -> tuple[bytes, str, str]:
+    """Read one eGK upload. Returns (image_bytes, mime_type, extension)."""
+    filename = (upload.filename or "").lower()
+    if not filename:
+        raise HTTPException(status_code=400, detail=f"{side}: filename is required")
+
+    ext = Path(filename).suffix.lower()
+    if ext not in _ALLOWED_ID_MIME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{side}: file must be JPG, JPEG, PNG, or PDF",
+        )
+
+    file_bytes = await upload.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail=f"{side}: empty file uploaded")
+
+    try:
+        image_bytes, mime_type = _prepare_egk_upload(file_bytes, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{side}: {exc}") from exc
+
+    return image_bytes, mime_type, ext
+
+
+def _combine_egk_ocr(front_text: str, back_text: str) -> str:
+    """Merge front and back OCR into labelled sections for the LLM."""
+    return "\n\n".join(
+        [
+            f"## Front\n{front_text.strip()}",
+            f"## Back\n{back_text.strip()}",
+        ]
+    )
+
+
+async def ocr_egk_card(
+    front: tuple[bytes, str],
+    back: tuple[bytes, str],
+) -> str:
+    """OCR front and back eGK images concurrently and return combined text."""
+    front_bytes, front_mime = front
+    back_bytes, back_mime = back
+
+    front_text, back_text = await asyncio.gather(
+        ocr_egk_image(front_bytes, mime_type=front_mime),
+        ocr_egk_image(back_bytes, mime_type=back_mime),
+    )
+
+    if not front_text.strip() and not back_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No text could be extracted from file_front or file_back",
+        )
+
+    return _combine_egk_ocr(front_text, back_text)
 
 
 # ---------------------------------------------------------------------------
@@ -899,24 +1011,61 @@ async def call_llm_completion(
     max_tokens: int = MAX_OUTPUT_TOKENS,
     temperature: float = LLM_TEMPERATURE,
     timeout: float = 120.0,
+    json_mode: bool = False,
 ) -> str:
     """Non-streaming completion from SGLang."""
+    payload: dict = {
+        "messages": messages,
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             f"{SGLANG_URL}/v1/chat/completions",
-            json={
-                "messages": messages,
-                "stream": False,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
+            json=payload,
         )
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=502,
                 detail=f"SGLang error: {resp.text[:400]}",
             )
-        return resp.json()["choices"][0]["message"]["content"]
+        return _message_content_from_response(resp.json())
+
+
+def _message_content_from_response(data: dict) -> str:
+    """Extract assistant text from an OpenAI-compatible chat completion."""
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        text = "".join(parts).strip()
+    else:
+        text = ""
+
+    if text:
+        return text
+
+    # Reasoning models may put the answer outside `content`.
+    for key in ("reasoning_content", "reasoning"):
+        fallback = message.get(key)
+        if isinstance(fallback, str) and fallback.strip():
+            return fallback.strip()
+
+    return ""
 
 
 async def _probe_llm(messages: list[dict]) -> str:
@@ -959,6 +1108,25 @@ class RephraseRequest(BaseModel):
 
 class RephraseResponse(BaseModel):
     text: str
+
+class EgkFields(BaseModel):
+    """Structured fields from a German eGK (elektronische Gesundheitskarte)."""
+
+    vorname: str | None = None
+    nachname: str | None = None
+    geburtsdatum: str | None = None
+    krankenversichertennummer: str | None = None
+    institutionskennzeichen: str | None = None
+    krankenkasse: str | None = None
+    gueltig_bis: str | None = None
+
+
+class IdCardExtractionResponse(BaseModel):
+    document_type: Literal["egk"] = "egk"
+    fields: EgkFields
+    extraction_time_s: float
+    ocr_time_s: float
+    llm_time_s: float
 
 
 class ChatHistoryMessage(BaseModel):
@@ -1047,6 +1215,87 @@ def strip_llm_artifacts(raw: str) -> str:
         text = text[1:-1].strip()
     text = _PREAMBLE_RE.sub("", text).strip()
     return text
+
+
+_EGK_JSON_SCHEMA = (
+    '{"vorname": null, "nachname": null, "geburtsdatum": null, '
+    '"krankenversichertennummer": null, "institutionskennzeichen": null, '
+    '"krankenkasse": null, "gueltig_bis": null}'
+)
+
+
+def build_egk_extraction_prompt(ocr_text: str) -> list[dict]:
+    """Build LLM messages to extract structured eGK fields from OCR text."""
+    system_prompt = (
+        "You extract structured fields from German eGK (elektronische Gesundheitskarte) "
+        "OCR text.\n\n"
+        "Rules:\n"
+        "- Use ONLY text present in the OCR output. Do not invent values.\n"
+        "- OCR text may contain ## Front and ## Back sections — use both when extracting.\n"
+        "- Output a single JSON object only — no markdown, no explanation, no thinking.\n"
+        "- Use null for fields not found.\n"
+        "- Preserve original spelling and date formatting as on the card.\n"
+        "- Field mapping:\n"
+        "  - Vorname / Vornamen → vorname\n"
+        "  - Name / Nachname / Familienname → nachname\n"
+        "  - geb. / Geburtsdatum / Geburtsdatum: → geburtsdatum\n"
+        "  - Krankenversichertennummer / KVNR / Vers.-Nr. / Versicherten-Nr. "
+        "→ krankenversichertennummer\n"
+        "  - Institutionskennzeichen / IK / IK-Nr. → institutionskennzeichen\n"
+        "  - Name der Krankenkasse / Kostenträger → krankenkasse\n"
+        "  - gültig bis / Gültig bis / bis → gueltig_bis\n"
+        "- Required keys: vorname, nachname, geburtsdatum, krankenversichertennummer, "
+        "institutionskennzeichen, krankenkasse, gueltig_bis"
+    )
+    user_content = (
+        f"OCR text from eGK:\n\n{ocr_text}\n\n"
+        f"Return JSON matching this schema:\n{_EGK_JSON_SCHEMA}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _extract_json_object(text: str) -> str:
+    """Pull the first top-level JSON object out of LLM output."""
+    text = strip_llm_artifacts(text)
+    start = text.find("{")
+    if start == -1:
+        return text
+
+    depth = 0
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    return text[start:]
+
+
+def parse_llm_json(raw: str) -> dict:
+    """Parse JSON from an LLM response, stripping common wrappers."""
+    if not raw or not raw.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="LLM returned an empty response",
+        )
+
+    candidate = _extract_json_object(raw)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        preview = raw.strip().replace("\n", " ")[:200]
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"LLM returned invalid JSON: {exc}. "
+                f"Raw preview: {preview!r}"
+            ),
+        ) from exc
 
 
 @app.get("/rephrase/styles", response_model=RephraseStylesResponse)
@@ -1218,6 +1467,130 @@ async def rephrase_text(request: Request, body: RephraseRequest):
     _append_metric(metric)
 
     return RephraseResponse(text=rewritten)
+
+
+# ---------------------------------------------------------------------------
+# eGK extraction endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/extract-id", response_model=IdCardExtractionResponse)
+async def extract_egk(
+    request: Request,
+    file_front: UploadFile = File(
+        ..., description="Front of eGK (JPG/PNG) or single-page PDF scan"
+    ),
+    file_back: UploadFile = File(
+        ..., description="Back of eGK (JPG/PNG) or single-page PDF scan"
+    ),
+):
+    """
+    Upload front and back photos/scans of a German eGK (health insurance card).
+    Chandra OCR extracts text from both sides; Qwen returns structured fields as JSON.
+    """
+    request_id: str = getattr(request.state, "request_id", str(uuid.uuid4())[:8])
+    t_start = time.perf_counter()
+
+    front_bytes, front_mime, front_ext = await _read_egk_side(file_front, "file_front")
+    back_bytes, back_mime, back_ext = await _read_egk_side(file_back, "file_back")
+
+    t_ocr = time.perf_counter()
+    try:
+        ocr_text = await ocr_egk_card(
+            (front_bytes, front_mime),
+            (back_bytes, back_mime),
+        )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="OCR request timed out") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[req=%s] eGK OCR failed", request_id)
+        raise HTTPException(status_code=502, detail=f"OCR failed: {exc}") from exc
+    ocr_time_s = round(time.perf_counter() - t_ocr, 4)
+
+    t_llm = time.perf_counter()
+    messages = build_egk_extraction_prompt(ocr_text)
+    try:
+        try:
+            raw_json = await call_llm_completion(
+                messages,
+                max_tokens=EXTRACT_ID_MAX_TOKENS,
+                temperature=EXTRACT_ID_TEMPERATURE,
+                timeout=EXTRACT_ID_TIMEOUT_S,
+                json_mode=True,
+            )
+        except HTTPException as exc:
+            # Some SGLang/model combos reject response_format — retry without it.
+            if exc.status_code != 502 or "response_format" not in str(exc.detail).lower():
+                raise
+            logger.warning(
+                "[req=%s] json_mode unsupported, retrying without response_format",
+                request_id,
+            )
+            raw_json = await call_llm_completion(
+                messages,
+                max_tokens=EXTRACT_ID_MAX_TOKENS,
+                temperature=EXTRACT_ID_TEMPERATURE,
+                timeout=EXTRACT_ID_TIMEOUT_S,
+                json_mode=False,
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="LLM request timed out") from exc
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=502, detail="SGLang server unreachable") from exc
+
+    logger.info(
+        "[req=%s] eGK LLM raw response (%d chars): %s",
+        request_id,
+        len(raw_json),
+        raw_json[:300].replace("\n", " ") + ("…" if len(raw_json) > 300 else ""),
+    )
+
+    parsed = parse_llm_json(raw_json)
+    try:
+        fields = EgkFields.model_validate(parsed)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM returned invalid field structure: {exc}",
+        ) from exc
+    llm_time_s = round(time.perf_counter() - t_llm, 4)
+
+    elapsed = round(time.perf_counter() - t_start, 4)
+    logger.info(
+        "[req=%s] POST /extract-id front=%s back=%s ocr_chars=%d ocr=%.3fs llm=%.3fs total=%.3fs",
+        request_id,
+        front_ext,
+        back_ext,
+        len(ocr_text),
+        ocr_time_s,
+        llm_time_s,
+        elapsed,
+    )
+    _append_metric(
+        {
+            "request_id": request_id,
+            "endpoint": "extract-id",
+            "document_type": "egk",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "input_ext_front": front_ext,
+            "input_ext_back": back_ext,
+            "ocr_chars": len(ocr_text),
+            "fields_found": sum(1 for v in fields.model_dump().values() if v),
+            "latency_s": elapsed,
+            "ocr_time_s": ocr_time_s,
+            "llm_time_s": llm_time_s,
+            "ocr_model": _chandra_model,
+            "llm_model": _active_model,
+        }
+    )
+
+    return IdCardExtractionResponse(
+        fields=fields,
+        extraction_time_s=elapsed,
+        ocr_time_s=ocr_time_s,
+        llm_time_s=llm_time_s,
+    )
 
 
 # ---------------------------------------------------------------------------
