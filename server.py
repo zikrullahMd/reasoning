@@ -8,7 +8,7 @@ FastAPI server that:
 4. Streams reasoning responses from Qwen via SGLang/vLLM
 5. Rewrites selected text via POST /rephrase (style + language)
 6. Streams general chat via POST /prompt
-7. Extracts structured fields from eGK uploads via POST /extract-id (file_front + file_back)
+7. Extracts structured fields from eGK + Personalausweis via POST /extract-id (4 uploads)
 8. Logs structured performance metrics to metrics.jsonl
 """
 
@@ -57,6 +57,7 @@ SGLANG_URL = os.getenv("SGLANG_URL", "http://localhost:30000")
 
 # Chandra OCR model served via vLLM
 CHANDRA_URL = os.getenv("CHANDRA_URL", "http://localhost:8000")
+CHANDRA_MODEL = os.getenv("CHANDRA_MODEL", "chandra").strip() or "chandra"
 CHANDRA_OCR_DPI = int(os.getenv("CHANDRA_OCR_DPI", "150"))
 
 # Context / token budget
@@ -250,7 +251,7 @@ perf_logger = logging.getLogger("perf")
 # ---------------------------------------------------------------------------
 
 _active_model: str = "unknown"   # Qwen / SGLang reasoning model
-_chandra_model: str = "unknown"  # Chandra OCR model
+_chandra_model: str = CHANDRA_MODEL  # Chandra OCR model
 
 _extraction_cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
@@ -346,10 +347,21 @@ async def lifespan(app: FastAPI):
             if resp.status_code == 200:
                 models = resp.json().get("data", [])
                 if models:
-                    _chandra_model = models[0].get("id", "unknown")
+                    discovered = models[0].get("id", CHANDRA_MODEL)
+                    _chandra_model = discovered or CHANDRA_MODEL
                     logger.info("Chandra OCR model: %s", _chandra_model)
+                else:
+                    _chandra_model = CHANDRA_MODEL
+                    logger.warning(
+                        "Chandra OCR returned no models — using %s", CHANDRA_MODEL
+                    )
         except Exception as exc:
-            logger.warning("Could not probe Chandra OCR at startup: %s", exc)
+            logger.warning(
+                "Could not probe Chandra OCR at startup: %s — using %s",
+                exc,
+                CHANDRA_MODEL,
+            )
+            _chandra_model = CHANDRA_MODEL
     yield
 
 
@@ -361,7 +373,7 @@ app = FastAPI(
     title="PDF Inference Pipeline",
     description=(
         "Upload PDFs and ask questions — Chandra OCR + Qwen reasoning + text rephrase "
-        "+ eGK field extraction"
+        "+ eGK + Personalausweis field extraction"
     ),
     version="2.1.0",
     lifespan=lifespan,
@@ -545,9 +557,9 @@ def _pdf_first_page_to_png(pdf_bytes: bytes) -> bytes:
     return png_bytes
 
 
-def _prepare_egk_upload(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+def _prepare_id_upload(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
     """
-    Normalize an uploaded eGK file to raw image bytes + MIME type for Chandra.
+    Normalize an uploaded ID document to raw image bytes + MIME type for Chandra.
 
     JPEG/PNG are passed through. PDF is rasterized to PNG via PyMuPDF.
     """
@@ -561,69 +573,63 @@ def _prepare_egk_upload(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
     return file_bytes, _ALLOWED_ID_MIME[ext]
 
 
-async def ocr_egk_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
-    """Run Chandra OCR on a single eGK image."""
+async def ocr_id_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
+    """Run Chandra OCR on a single ID document image."""
     b64 = base64.b64encode(image_bytes).decode()
     async with httpx.AsyncClient(timeout=EXTRACT_ID_OCR_TIMEOUT_S) as client:
         raw = await _ocr_page_with_chandra(b64, page_num=1, client=client, mime_type=mime_type)
     return normalize_page_text(raw)
 
 
-async def _read_egk_side(upload: UploadFile, side: str) -> tuple[bytes, str, str]:
-    """Read one eGK upload. Returns (image_bytes, mime_type, extension)."""
+async def _read_id_upload(upload: UploadFile, field: str) -> tuple[bytes, str, str]:
+    """Read one ID upload. Returns (image_bytes, mime_type, extension)."""
     filename = (upload.filename or "").lower()
     if not filename:
-        raise HTTPException(status_code=400, detail=f"{side}: filename is required")
+        raise HTTPException(status_code=400, detail=f"{field}: filename is required")
 
     ext = Path(filename).suffix.lower()
     if ext not in _ALLOWED_ID_MIME:
         raise HTTPException(
             status_code=400,
-            detail=f"{side}: file must be JPG, JPEG, PNG, or PDF",
+            detail=f"{field}: file must be JPG, JPEG, PNG, or PDF",
         )
 
     file_bytes = await upload.read()
     if not file_bytes:
-        raise HTTPException(status_code=400, detail=f"{side}: empty file uploaded")
+        raise HTTPException(status_code=400, detail=f"{field}: empty file uploaded")
 
     try:
-        image_bytes, mime_type = _prepare_egk_upload(file_bytes, filename)
+        image_bytes, mime_type = _prepare_id_upload(file_bytes, filename)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"{side}: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"{field}: {exc}") from exc
 
     return image_bytes, mime_type, ext
 
 
-def _combine_egk_ocr(front_text: str, back_text: str) -> str:
-    """Merge front and back OCR into labelled sections for the LLM."""
-    return "\n\n".join(
-        [
-            f"## Front\n{front_text.strip()}",
-            f"## Back\n{back_text.strip()}",
-        ]
-    )
+def _combine_id_ocr(sections: list[tuple[str, str]]) -> str:
+    """Merge labelled OCR sections for the LLM."""
+    parts = [f"## {label}\n{text.strip()}" for label, text in sections if text.strip()]
+    return "\n\n".join(parts)
 
 
-async def ocr_egk_card(
-    front: tuple[bytes, str],
-    back: tuple[bytes, str],
+async def ocr_id_documents(
+    sides: list[tuple[tuple[bytes, str], str]],
 ) -> str:
-    """OCR front and back eGK images concurrently and return combined text."""
-    front_bytes, front_mime = front
-    back_bytes, back_mime = back
+    """OCR multiple ID images concurrently and return combined labelled text."""
+    ocr_tasks = [
+        ocr_id_image(image_bytes, mime_type=mime_type)
+        for (image_bytes, mime_type), _label in sides
+    ]
+    texts = await asyncio.gather(*ocr_tasks)
 
-    front_text, back_text = await asyncio.gather(
-        ocr_egk_image(front_bytes, mime_type=front_mime),
-        ocr_egk_image(back_bytes, mime_type=back_mime),
-    )
-
-    if not front_text.strip() and not back_text.strip():
+    sections = [(label, text) for text, (_data, label) in zip(texts, sides)]
+    if not any(text.strip() for text in texts):
         raise HTTPException(
             status_code=400,
-            detail="No text could be extracted from file_front or file_back",
+            detail="No text could be extracted from any uploaded file",
         )
 
-    return _combine_egk_ocr(front_text, back_text)
+    return _combine_id_ocr(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -1109,21 +1115,32 @@ class RephraseRequest(BaseModel):
 class RephraseResponse(BaseModel):
     text: str
 
-class EgkFields(BaseModel):
-    """Structured fields from a German eGK (elektronische Gesundheitskarte)."""
+class IdCardFields(BaseModel):
+    """Structured fields merged from eGK and Personalausweis."""
 
+    # Person (prefer Personalausweis when values differ)
     vorname: str | None = None
     nachname: str | None = None
     geburtsdatum: str | None = None
+    geburtsort: str | None = None
+    adresse: str | None = None
+    staatsangehoerigkeit: str | None = None
+
+    # eGK
     krankenversichertennummer: str | None = None
     institutionskennzeichen: str | None = None
     krankenkasse: str | None = None
-    gueltig_bis: str | None = None
+    gueltig_bis_egk: str | None = None
+
+    # Personalausweis / Aufenthaltstitel
+    ausweisnummer: str | None = None
+    gueltig_bis_ausweis: str | None = None
+    aufenthaltstitel_nummer: str | None = None
 
 
 class IdCardExtractionResponse(BaseModel):
-    document_type: Literal["egk"] = "egk"
-    fields: EgkFields
+    document_types: list[Literal["egk", "personalausweis"]] = ["egk", "personalausweis"]
+    fields: IdCardFields
     extraction_time_s: float
     ocr_time_s: float
     llm_time_s: float
@@ -1217,39 +1234,56 @@ def strip_llm_artifacts(raw: str) -> str:
     return text
 
 
-_EGK_JSON_SCHEMA = (
-    '{"vorname": null, "nachname": null, "geburtsdatum": null, '
+_ID_JSON_SCHEMA = (
+    '{"vorname": null, "nachname": null, "geburtsdatum": null, "geburtsort": null, '
+    '"adresse": null, "staatsangehoerigkeit": null, '
     '"krankenversichertennummer": null, "institutionskennzeichen": null, '
-    '"krankenkasse": null, "gueltig_bis": null}'
+    '"krankenkasse": null, "gueltig_bis_egk": null, '
+    '"ausweisnummer": null, "gueltig_bis_ausweis": null, "aufenthaltstitel_nummer": null}'
 )
 
 
-def build_egk_extraction_prompt(ocr_text: str) -> list[dict]:
-    """Build LLM messages to extract structured eGK fields from OCR text."""
+def build_id_extraction_prompt(ocr_text: str) -> list[dict]:
+    """Build LLM messages to extract fields from eGK + Personalausweis OCR text."""
     system_prompt = (
-        "You extract structured fields from German eGK (elektronische Gesundheitskarte) "
-        "OCR text.\n\n"
+        "You extract structured fields from German identity documents:\n"
+        "- eGK (elektronische Gesundheitskarte / health insurance card)\n"
+        "- Personalausweis (national ID card)\n"
+        "- Aufenthaltstitel references if present on the documents\n\n"
         "Rules:\n"
         "- Use ONLY text present in the OCR output. Do not invent values.\n"
-        "- OCR text may contain ## Front and ## Back sections — use both when extracting.\n"
+        "- OCR text has sections: eGK Front, eGK Back, Personalausweis Front, "
+        "Personalausweis Back — use all relevant sections.\n"
         "- Output a single JSON object only — no markdown, no explanation, no thinking.\n"
         "- Use null for fields not found.\n"
-        "- Preserve original spelling and date formatting as on the card.\n"
+        "- Preserve original spelling and date formatting as on the document.\n"
+        "- For shared person fields (name, birth date, address), prefer Personalausweis "
+        "over eGK when values differ.\n"
         "- Field mapping:\n"
-        "  - Vorname / Vornamen → vorname\n"
-        "  - Name / Nachname / Familienname → nachname\n"
-        "  - geb. / Geburtsdatum / Geburtsdatum: → geburtsdatum\n"
-        "  - Krankenversichertennummer / KVNR / Vers.-Nr. / Versicherten-Nr. "
-        "→ krankenversichertennummer\n"
-        "  - Institutionskennzeichen / IK / IK-Nr. → institutionskennzeichen\n"
-        "  - Name der Krankenkasse / Kostenträger → krankenkasse\n"
-        "  - gültig bis / Gültig bis / bis → gueltig_bis\n"
-        "- Required keys: vorname, nachname, geburtsdatum, krankenversichertennummer, "
-        "institutionskennzeichen, krankenkasse, gueltig_bis"
+        "  Person:\n"
+        "    - Vorname / Vornamen → vorname\n"
+        "    - Name / Nachname / Familienname → nachname\n"
+        "    - Geburtsdatum / geb. am / geboren am → geburtsdatum\n"
+        "    - Geburtsort / geb. in → geburtsort\n"
+        "    - Anschrift / Adresse / Wohnort (full address as on card) → adresse\n"
+        "    - Staatsangehörigkeit / Staatsangehoerigkeit → staatsangehoerigkeit\n"
+        "  eGK:\n"
+        "    - Krankenversichertennummer / KVNR / Vers.-Nr. → krankenversichertennummer\n"
+        "    - Institutionskennzeichen / IK / IK-Nr. → institutionskennzeichen\n"
+        "    - Krankenkasse / Kostenträger → krankenkasse\n"
+        "    - gültig bis on eGK → gueltig_bis_egk\n"
+        "  Personalausweis:\n"
+        "    - Ausweisnummer / Document number → ausweisnummer\n"
+        "    - gültig bis on Personalausweis → gueltig_bis_ausweis\n"
+        "    - Aufenthaltstitel-Nr. / Aufenthaltstitel / AT-Nr. → aufenthaltstitel_nummer\n"
+        "- Required keys: vorname, nachname, geburtsdatum, geburtsort, adresse, "
+        "staatsangehoerigkeit, krankenversichertennummer, institutionskennzeichen, "
+        "krankenkasse, gueltig_bis_egk, ausweisnummer, gueltig_bis_ausweis, "
+        "aufenthaltstitel_nummer"
     )
     user_content = (
-        f"OCR text from eGK:\n\n{ocr_text}\n\n"
-        f"Return JSON matching this schema:\n{_EGK_JSON_SCHEMA}"
+        f"OCR text from identity documents:\n\n{ocr_text}\n\n"
+        f"Return JSON matching this schema:\n{_ID_JSON_SCHEMA}"
     )
     return [
         {"role": "system", "content": system_prompt},
@@ -1470,46 +1504,64 @@ async def rephrase_text(request: Request, body: RephraseRequest):
 
 
 # ---------------------------------------------------------------------------
-# eGK extraction endpoint
+# ID extraction endpoint (eGK + Personalausweis)
 # ---------------------------------------------------------------------------
 
 @app.post("/extract-id", response_model=IdCardExtractionResponse)
-async def extract_egk(
+async def extract_id_documents(
     request: Request,
-    file_front: UploadFile = File(
-        ..., description="Front of eGK (JPG/PNG) or single-page PDF scan"
+    file_egk_front: UploadFile = File(
+        ..., description="Front of eGK (JPG/PNG/PDF)"
     ),
-    file_back: UploadFile = File(
-        ..., description="Back of eGK (JPG/PNG) or single-page PDF scan"
+    file_egk_back: UploadFile = File(
+        ..., description="Back of eGK (JPG/PNG/PDF)"
+    ),
+    file_ausweis_front: UploadFile = File(
+        ..., description="Front of Personalausweis (JPG/PNG/PDF)"
+    ),
+    file_ausweis_back: UploadFile = File(
+        ..., description="Back of Personalausweis (JPG/PNG/PDF)"
     ),
 ):
     """
-    Upload front and back photos/scans of a German eGK (health insurance card).
-    Chandra OCR extracts text from both sides; Qwen returns structured fields as JSON.
+    Upload front and back of eGK and Personalausweis.
+    Chandra OCR extracts text from all four; Qwen returns merged structured fields.
     """
     request_id: str = getattr(request.state, "request_id", str(uuid.uuid4())[:8])
     t_start = time.perf_counter()
 
-    front_bytes, front_mime, front_ext = await _read_egk_side(file_front, "file_front")
-    back_bytes, back_mime, back_ext = await _read_egk_side(file_back, "file_back")
+    uploads = await asyncio.gather(
+        _read_id_upload(file_egk_front, "file_egk_front"),
+        _read_id_upload(file_egk_back, "file_egk_back"),
+        _read_id_upload(file_ausweis_front, "file_ausweis_front"),
+        _read_id_upload(file_ausweis_back, "file_ausweis_back"),
+    )
+    (egk_front_bytes, egk_front_mime, egk_front_ext) = uploads[0]
+    (egk_back_bytes, egk_back_mime, egk_back_ext) = uploads[1]
+    (ausweis_front_bytes, ausweis_front_mime, ausweis_front_ext) = uploads[2]
+    (ausweis_back_bytes, ausweis_back_mime, ausweis_back_ext) = uploads[3]
 
     t_ocr = time.perf_counter()
     try:
-        ocr_text = await ocr_egk_card(
-            (front_bytes, front_mime),
-            (back_bytes, back_mime),
+        ocr_text = await ocr_id_documents(
+            [
+                ((egk_front_bytes, egk_front_mime), "eGK Front"),
+                ((egk_back_bytes, egk_back_mime), "eGK Back"),
+                ((ausweis_front_bytes, ausweis_front_mime), "Personalausweis Front"),
+                ((ausweis_back_bytes, ausweis_back_mime), "Personalausweis Back"),
+            ]
         )
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="OCR request timed out") from exc
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("[req=%s] eGK OCR failed", request_id)
+        logger.exception("[req=%s] ID document OCR failed", request_id)
         raise HTTPException(status_code=502, detail=f"OCR failed: {exc}") from exc
     ocr_time_s = round(time.perf_counter() - t_ocr, 4)
 
     t_llm = time.perf_counter()
-    messages = build_egk_extraction_prompt(ocr_text)
+    messages = build_id_extraction_prompt(ocr_text)
     try:
         try:
             raw_json = await call_llm_completion(
@@ -1520,7 +1572,6 @@ async def extract_egk(
                 json_mode=True,
             )
         except HTTPException as exc:
-            # Some SGLang/model combos reject response_format — retry without it.
             if exc.status_code != 502 or "response_format" not in str(exc.detail).lower():
                 raise
             logger.warning(
@@ -1540,7 +1591,7 @@ async def extract_egk(
         raise HTTPException(status_code=502, detail="SGLang server unreachable") from exc
 
     logger.info(
-        "[req=%s] eGK LLM raw response (%d chars): %s",
+        "[req=%s] ID LLM raw response (%d chars): %s",
         request_id,
         len(raw_json),
         raw_json[:300].replace("\n", " ") + ("…" if len(raw_json) > 300 else ""),
@@ -1548,7 +1599,7 @@ async def extract_egk(
 
     parsed = parse_llm_json(raw_json)
     try:
-        fields = EgkFields.model_validate(parsed)
+        fields = IdCardFields.model_validate(parsed)
     except ValidationError as exc:
         raise HTTPException(
             status_code=502,
@@ -1558,10 +1609,8 @@ async def extract_egk(
 
     elapsed = round(time.perf_counter() - t_start, 4)
     logger.info(
-        "[req=%s] POST /extract-id front=%s back=%s ocr_chars=%d ocr=%.3fs llm=%.3fs total=%.3fs",
+        "[req=%s] POST /extract-id ocr_chars=%d ocr=%.3fs llm=%.3fs total=%.3fs",
         request_id,
-        front_ext,
-        back_ext,
         len(ocr_text),
         ocr_time_s,
         llm_time_s,
@@ -1571,10 +1620,12 @@ async def extract_egk(
         {
             "request_id": request_id,
             "endpoint": "extract-id",
-            "document_type": "egk",
+            "document_types": ["egk", "personalausweis"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "input_ext_front": front_ext,
-            "input_ext_back": back_ext,
+            "input_ext_egk_front": egk_front_ext,
+            "input_ext_egk_back": egk_back_ext,
+            "input_ext_ausweis_front": ausweis_front_ext,
+            "input_ext_ausweis_back": ausweis_back_ext,
             "ocr_chars": len(ocr_text),
             "fields_found": sum(1 for v in fields.model_dump().values() if v),
             "latency_s": elapsed,
@@ -2046,12 +2097,18 @@ async def health_check():
                 ]
                 if chandra_models:
                     _chandra_model = chandra_models[0]
+                elif _chandra_model == "unknown":
+                    _chandra_model = CHANDRA_MODEL
             else:
                 chandra_status = f"error: {resp.status_code}"
         except httpx.ConnectError:
             chandra_status = "unreachable"
+            if _chandra_model == "unknown":
+                _chandra_model = CHANDRA_MODEL
         except Exception as exc:
             chandra_status = f"error: {exc}"
+            if _chandra_model == "unknown":
+                _chandra_model = CHANDRA_MODEL
 
     return {
         "status": "healthy",
