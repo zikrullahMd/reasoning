@@ -1980,46 +1980,88 @@ async def get_stats():
     def _avg(values: list[float]) -> float:
         return round(sum(values) / len(values), 4) if values else 0.0
 
+    def _perf(record: dict) -> dict:
+        perf = record.get("performance")
+        return perf if isinstance(perf, dict) else {}
+
+    def _reasoning_model(record: dict) -> str:
+        model = record.get("model")
+        if isinstance(model, dict):
+            return str(
+                model.get("reasoning_model") or model.get("id") or "unknown"
+            )
+        if isinstance(model, str):
+            return model
+        return str(record.get("llm_model") or "unknown")
+
+    def _ocr_model(record: dict) -> str:
+        model = record.get("model")
+        if isinstance(model, dict):
+            return str(model.get("ocr_model") or "unknown")
+        return str(record.get("ocr_model") or "unknown")
+
     total = len(records)
-    ttfts = [r["performance"].get("time_to_first_token_s", 0.0) for r in records]
+    perf_records = [r for r in records if _perf(r)]
+
+    ttfts = [_perf(r).get("time_to_first_token_s", 0.0) for r in perf_records]
     tpss = [
-        r["performance"].get("tokens_per_second", 0.0)
-        for r in records
-        if r["performance"].get("tokens_per_second", 0.0) > 0
+        _perf(r).get("tokens_per_second", 0.0)
+        for r in perf_records
+        if _perf(r).get("tokens_per_second", 0.0) > 0
     ]
-    total_times = [r["performance"].get("total_request_time_s", 0.0) for r in records]
-    extraction_times = [r["performance"].get("extraction_time_s", 0.0) for r in records]
+    total_times = [_perf(r).get("total_request_time_s", 0.0) for r in perf_records]
+    extraction_times = [_perf(r).get("extraction_time_s", 0.0) for r in perf_records]
 
     method_counts: dict[str, int] = {}
     reasoning_model_counts: dict[str, int] = {}
     ocr_model_counts: dict[str, int] = {}
+    endpoint_counts: dict[str, int] = {}
     for r in records:
-        method = r.get("pdf", {}).get("extraction_method", "unknown")
-        method_counts[method] = method_counts.get(method, 0) + 1
-        rm = r.get("model", {}).get("reasoning_model") or r.get("model", {}).get(
-            "id", "unknown"
-        )
+        endpoint = str(r.get("endpoint") or "analyze")
+        endpoint_counts[endpoint] = endpoint_counts.get(endpoint, 0) + 1
+
+        pdf = r.get("pdf")
+        if isinstance(pdf, dict):
+            method = pdf.get("extraction_method", "unknown")
+            method_counts[method] = method_counts.get(method, 0) + 1
+
+        rm = _reasoning_model(r)
         reasoning_model_counts[rm] = reasoning_model_counts.get(rm, 0) + 1
-        om = r.get("model", {}).get("ocr_model", "unknown")
+        om = _ocr_model(r)
         ocr_model_counts[om] = ocr_model_counts.get(om, 0) + 1
 
+    quality_records = [r for r in records if isinstance(r.get("quality_signals"), dict)]
+    quality_total = len(quality_records) or total
     said_not_found = sum(
         1
-        for r in records
+        for r in quality_records
         if r.get("quality_signals", {}).get("said_not_found", False)
     )
     empty_responses = sum(
-        1 for r in records if r.get("quality_signals", {}).get("response_empty", False)
+        1
+        for r in quality_records
+        if r.get("quality_signals", {}).get("response_empty", False)
     )
 
-    sorted_by_ttft = sorted(
-        records, key=lambda r: r["performance"].get("time_to_first_token_s", 0.0)
-    )
-    fastest = sorted_by_ttft[0]
-    slowest = sorted_by_ttft[-1]
+    ttft_records = [
+        r
+        for r in perf_records
+        if _perf(r).get("time_to_first_token_s") is not None
+    ]
+    fastest: dict = {}
+    slowest: dict = {}
+    if ttft_records:
+        sorted_by_ttft = sorted(
+            ttft_records,
+            key=lambda r: _perf(r).get("time_to_first_token_s", 0.0),
+        )
+        fastest = sorted_by_ttft[0]
+        slowest = sorted_by_ttft[-1]
 
     return {
         "total_requests": total,
+        "endpoints": endpoint_counts,
+        "analyze_performance_samples": len(perf_records),
         "averages": {
             "time_to_first_token_s": _avg(ttfts),
             "tokens_per_second": _avg(tpss),
@@ -2032,27 +2074,27 @@ async def get_stats():
         "quality": {
             "said_not_found_count": said_not_found,
             "empty_response_count": empty_responses,
-            "said_not_found_pct": round(said_not_found / total * 100, 1),
+            "said_not_found_pct": round(said_not_found / quality_total * 100, 1),
         },
         "fastest_prompt": {
             "request_id": fastest.get("request_id"),
-            "question": fastest.get("prompt", {}).get("question"),
-            "time_to_first_token_s": fastest.get("performance", {}).get(
-                "time_to_first_token_s"
-            ),
-            "tokens_per_second": fastest.get("performance", {}).get("tokens_per_second"),
-            "reasoning_model": fastest.get("model", {}).get("reasoning_model"),
-            "ocr_model": fastest.get("model", {}).get("ocr_model"),
+            "question": fastest.get("prompt", {}).get("question")
+            if isinstance(fastest.get("prompt"), dict)
+            else None,
+            "time_to_first_token_s": _perf(fastest).get("time_to_first_token_s"),
+            "tokens_per_second": _perf(fastest).get("tokens_per_second"),
+            "reasoning_model": _reasoning_model(fastest) if fastest else None,
+            "ocr_model": _ocr_model(fastest) if fastest else None,
         },
         "slowest_prompt": {
             "request_id": slowest.get("request_id"),
-            "question": slowest.get("prompt", {}).get("question"),
-            "time_to_first_token_s": slowest.get("performance", {}).get(
-                "time_to_first_token_s"
-            ),
-            "tokens_per_second": slowest.get("performance", {}).get("tokens_per_second"),
-            "reasoning_model": slowest.get("model", {}).get("reasoning_model"),
-            "ocr_model": slowest.get("model", {}).get("ocr_model"),
+            "question": slowest.get("prompt", {}).get("question")
+            if isinstance(slowest.get("prompt"), dict)
+            else None,
+            "time_to_first_token_s": _perf(slowest).get("time_to_first_token_s"),
+            "tokens_per_second": _perf(slowest).get("tokens_per_second"),
+            "reasoning_model": _reasoning_model(slowest) if slowest else None,
+            "ocr_model": _ocr_model(slowest) if slowest else None,
         },
     }
 
