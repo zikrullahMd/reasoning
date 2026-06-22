@@ -4,8 +4,10 @@ Always-on gateway for the PDF inference pipeline.
 - Probes Chandra OCR (/health) and main FastAPI (/health, /stats).
 - Proxies most traffic to FastAPI when the full pipeline is ready.
 - Proxies CHANDRA_PROXY_PATHS (default: classify, extract) directly to Chandra OCR.
-- Returns 503 with a clear message when the target upstream is offline.
-- Queues POST requests while offline and replays them when services recover.
+- When /analyze is submitted while the pipeline is offline, stores the PDF in S3
+  (or local disk when S3_BUCKET is unset) and records the question in SQLite.
+- Drains analysis jobs when the pipeline recovers; clients poll GET /jobs/{id} for results.
+- Queues other POST bodies while offline and replays them when services recover.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,17 @@ CHANDRA_DIRECT_PROBE_TIMEOUT_S = float(
 QUEUE_DB = Path(os.getenv("QUEUE_DB", "micro_queue.db"))
 QUEUE_DIR = Path(os.getenv("QUEUE_DIR", "micro_queue_files"))
 MAX_QUEUE_BYTES = int(os.getenv("MAX_QUEUE_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+
+S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
+S3_PREFIX = os.getenv("S3_PREFIX", "offline-jobs").strip().strip("/")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+JOB_MAX_RETRIES = int(os.getenv("JOB_MAX_RETRIES", "3"))
+JOB_DRAIN_CONCURRENCY = int(os.getenv("JOB_DRAIN_CONCURRENCY", "2"))
+JOB_RESULT_LOCAL_THRESHOLD = int(
+    os.getenv("JOB_RESULT_LOCAL_THRESHOLD", str(256 * 1024))
+)
+ANALYZE_MAX_BYTES = int(os.getenv("ANALYZE_MAX_BYTES", str(50 * 1024 * 1024)))
+JOB_CALLBACK_TIMEOUT_S = float(os.getenv("JOB_CALLBACK_TIMEOUT_S", "30"))
 
 OFFLINE_MESSAGE = os.getenv(
     "OFFLINE_MESSAGE",
@@ -215,6 +228,28 @@ def _init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analysis_jobs (
+                id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL DEFAULT 'analyze',
+                status TEXT NOT NULL DEFAULT 'queued',
+                question TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                input_storage TEXT NOT NULL,
+                input_key TEXT NOT NULL,
+                result_storage TEXT,
+                result_key TEXT,
+                result_text TEXT,
+                callback_url TEXT,
+                user_id TEXT,
+                created_at TEXT NOT NULL,
+                processed_at TEXT,
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         conn.commit()
 
 
@@ -295,6 +330,370 @@ def _load_body(row: sqlite3.Row) -> bytes:
     if row["body_path"]:
         return Path(row["body_path"]).read_bytes()
     return row["body_blob"] or b""
+
+
+# ---------------------------------------------------------------------------
+# Object storage (S3 when configured, else local files under QUEUE_DIR)
+# ---------------------------------------------------------------------------
+
+_s3_client: Any = None
+
+
+def _storage_backend() -> str:
+    return "s3" if S3_BUCKET else "local"
+
+
+def _get_s3_client() -> Any:
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+
+        _s3_client = boto3.client("s3", region_name=AWS_REGION)
+    return _s3_client
+
+
+def _put_bytes(key_suffix: str, data: bytes, content_type: str) -> tuple[str, str]:
+    if S3_BUCKET:
+        key = f"{S3_PREFIX}/{key_suffix}"
+        _get_s3_client().put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+        return "s3", key
+
+    local_path = QUEUE_DIR / key_suffix
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(data)
+    return "local", str(local_path)
+
+
+def _get_bytes(storage: str, key: str) -> bytes:
+    if storage == "s3":
+        resp = _get_s3_client().get_object(Bucket=S3_BUCKET, Key=key)
+        return resp["Body"].read()
+    return Path(key).read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Analysis jobs (PDF + question → deferred /analyze)
+# ---------------------------------------------------------------------------
+
+def _create_analysis_job(
+    *,
+    pdf_bytes: bytes,
+    filename: str,
+    question: str,
+    callback_url: str | None = None,
+    user_id: str | None = None,
+) -> str:
+    if len(pdf_bytes) > ANALYZE_MAX_BYTES:
+        raise ValueError(f"PDF exceeds {ANALYZE_MAX_BYTES} bytes")
+
+    job_id = str(uuid.uuid4())
+    safe_name = filename.replace("/", "_").replace("\\", "_") or "document.pdf"
+    input_storage, input_key = _put_bytes(
+        f"inputs/{job_id}/{safe_name}",
+        pdf_bytes,
+        "application/pdf",
+    )
+
+    with sqlite3.connect(QUEUE_DB) as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (
+                id, job_type, status, question, filename,
+                input_storage, input_key, callback_url, user_id, created_at
+            ) VALUES (?, 'analyze', 'queued', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                question,
+                safe_name,
+                input_storage,
+                input_key,
+                callback_url,
+                user_id,
+                _now_iso(),
+            ),
+        )
+        conn.commit()
+    logger.info(
+        "Queued analysis job %s (%s, %d bytes, storage=%s)",
+        job_id,
+        safe_name,
+        len(pdf_bytes),
+        input_storage,
+    )
+    return job_id
+
+
+def _get_analysis_job(job_id: str) -> sqlite3.Row | None:
+    with sqlite3.connect(QUEUE_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT * FROM analysis_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+
+
+def _list_analysis_jobs(limit: int = 100) -> list[sqlite3.Row]:
+    with sqlite3.connect(QUEUE_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            """
+            SELECT id, job_type, status, question, filename, user_id,
+                   callback_url, created_at, processed_at, error, retry_count
+            FROM analysis_jobs
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def _claim_analysis_job(job_id: str) -> bool:
+    with sqlite3.connect(QUEUE_DB) as conn:
+        cur = conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'processing'
+            WHERE id = ? AND status = 'queued'
+            """,
+            (job_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def _store_job_result(job_id: str, result_text: str) -> None:
+    result_storage: str | None = None
+    result_key: str | None = None
+    db_result_text: str | None = result_text
+
+    if len(result_text.encode("utf-8")) > JOB_RESULT_LOCAL_THRESHOLD:
+        result_storage, result_key = _put_bytes(
+            f"results/{job_id}/answer.txt",
+            result_text.encode("utf-8"),
+            "text/plain; charset=utf-8",
+        )
+        db_result_text = None
+
+    with sqlite3.connect(QUEUE_DB) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'completed',
+                processed_at = ?,
+                error = NULL,
+                result_storage = ?,
+                result_key = ?,
+                result_text = ?
+            WHERE id = ?
+            """,
+            (_now_iso(), result_storage, result_key, db_result_text, job_id),
+        )
+        conn.commit()
+
+
+def _mark_analysis_job_failed(
+    job_id: str,
+    error: str,
+    *,
+    requeue: bool = False,
+) -> None:
+    with sqlite3.connect(QUEUE_DB) as conn:
+        if requeue:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'queued',
+                    error = ?,
+                    retry_count = retry_count + 1
+                WHERE id = ?
+                """,
+                (error, job_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'failed',
+                    processed_at = ?,
+                    error = ?
+                WHERE id = ?
+                """,
+                (_now_iso(), error, job_id),
+            )
+        conn.commit()
+
+
+def _job_result_text(row: sqlite3.Row) -> str | None:
+    if row["status"] != "completed":
+        return None
+    if row["result_text"]:
+        return row["result_text"]
+    if row["result_storage"] and row["result_key"]:
+        return _get_bytes(row["result_storage"], row["result_key"]).decode(
+            "utf-8", errors="replace"
+        )
+    return None
+
+
+def _job_public_dict(row: sqlite3.Row, *, include_result: bool = True) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "job_id": row["id"],
+        "job_type": row["job_type"],
+        "status": row["status"],
+        "question": row["question"],
+        "filename": row["filename"],
+        "user_id": row["user_id"],
+        "callback_url": row["callback_url"],
+        "created_at": row["created_at"],
+        "processed_at": row["processed_at"],
+        "error": row["error"],
+        "retry_count": row["retry_count"],
+        "poll_url": f"/jobs/{row['id']}",
+    }
+    if include_result and row["status"] == "completed":
+        payload["result"] = _job_result_text(row)
+    return payload
+
+
+async def _deliver_job_callback(row: sqlite3.Row, result_text: str) -> None:
+    callback_url = row["callback_url"]
+    if not callback_url:
+        return
+
+    payload = {
+        "job_id": row["id"],
+        "status": "completed",
+        "job_type": row["job_type"],
+        "question": row["question"],
+        "filename": row["filename"],
+        "result": result_text,
+        "processed_at": _now_iso(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=JOB_CALLBACK_TIMEOUT_S) as client:
+            resp = await client.post(callback_url, json=payload)
+        if resp.status_code >= 400:
+            logger.warning(
+                "Callback for job %s returned %s: %s",
+                row["id"],
+                resp.status_code,
+                resp.text[:500],
+            )
+        else:
+            logger.info("Delivered callback for job %s → %s", row["id"], callback_url)
+    except Exception as exc:
+        logger.warning("Callback for job %s failed: %s", row["id"], exc)
+
+
+async def _process_analysis_job(row: sqlite3.Row) -> None:
+    job_id = row["id"]
+    if not _claim_analysis_job(job_id):
+        return
+
+    try:
+        pdf_bytes = _get_bytes(row["input_storage"], row["input_key"])
+        async with httpx.AsyncClient(timeout=None) as client:
+            resp = await client.post(
+                f"{FASTAPI_URL}/analyze",
+                files={
+                    "file": (
+                        row["filename"],
+                        pdf_bytes,
+                        "application/pdf",
+                    )
+                },
+                data={"question": row["question"]},
+            )
+
+        if resp.status_code >= 500:
+            error = f"upstream {resp.status_code}: {resp.text[:500]}"
+            if row["retry_count"] + 1 < JOB_MAX_RETRIES:
+                _mark_analysis_job_failed(job_id, error, requeue=True)
+                logger.warning("Job %s re-queued after upstream error", job_id)
+            else:
+                _mark_analysis_job_failed(job_id, error, requeue=False)
+            return
+
+        if resp.status_code >= 400:
+            _mark_analysis_job_failed(
+                job_id,
+                f"upstream {resp.status_code}: {resp.text[:500]}",
+                requeue=False,
+            )
+            return
+
+        result_text = (await resp.aread()).decode("utf-8", errors="replace")
+        _store_job_result(job_id, result_text)
+        logger.info("Completed analysis job %s (%d chars)", job_id, len(result_text))
+
+        updated = _get_analysis_job(job_id)
+        if updated:
+            await _deliver_job_callback(updated, result_text)
+    except Exception as exc:
+        error = str(exc)
+        if row["retry_count"] + 1 < JOB_MAX_RETRIES:
+            _mark_analysis_job_failed(job_id, error, requeue=True)
+            logger.warning("Job %s re-queued after error: %s", job_id, exc)
+        else:
+            _mark_analysis_job_failed(job_id, error, requeue=False)
+            logger.exception("Failed analysis job %s", job_id)
+
+
+def _fetch_queued_analysis_jobs(limit: int = 20) -> list[sqlite3.Row]:
+    with sqlite3.connect(QUEUE_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            """
+            SELECT * FROM analysis_jobs
+            WHERE status = 'queued'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+async def _drain_analysis_jobs_once() -> None:
+    async with _upstream_lock:
+        if not _upstream.get("pipeline_ready"):
+            return
+
+    rows = _fetch_queued_analysis_jobs()
+    if not rows:
+        return
+
+    logger.info("Processing %d queued analysis job(s)...", len(rows))
+    semaphore = asyncio.Semaphore(JOB_DRAIN_CONCURRENCY)
+
+    async def _run(row: sqlite3.Row) -> None:
+        async with semaphore:
+            await _process_analysis_job(row)
+
+    await asyncio.gather(*[_run(row) for row in rows])
+
+
+async def _forward_analyze(
+    pdf_bytes: bytes,
+    filename: str,
+    question: str,
+) -> Response | StreamingResponse | JSONResponse:
+    return await _forward_upstream(
+        method="POST",
+        url=f"{FASTAPI_URL}/analyze",
+        headers={},
+        body=b"",
+        upstream_label="FastAPI",
+        multipart_files={
+            "file": (filename, pdf_bytes, "application/pdf"),
+        },
+        multipart_data={"question": question},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -487,11 +886,22 @@ async def _forward_upstream(
     headers: dict[str, str],
     body: bytes,
     upstream_label: str,
+    multipart_files: dict[str, tuple[str, bytes, str]] | None = None,
+    multipart_data: dict[str, str] | None = None,
 ) -> Response | StreamingResponse | JSONResponse:
     """Proxy an HTTP request to an upstream and return the client response."""
     client = httpx.AsyncClient(timeout=None)
     try:
-        upstream_req = client.build_request(method, url, headers=headers, content=body)
+        if multipart_files or multipart_data:
+            upstream_req = client.build_request(
+                method,
+                url,
+                headers=headers,
+                files=multipart_files or {},
+                data=multipart_data or {},
+            )
+        else:
+            upstream_req = client.build_request(method, url, headers=headers, content=body)
         upstream_resp = await client.send(upstream_req, stream=True)
 
         resp_headers = {
@@ -545,6 +955,7 @@ async def _forward_upstream(
 async def _health_poller() -> None:
     while True:
         await _refresh_upstream_status()
+        await _drain_analysis_jobs_once()
         await _drain_queue_once()
         await asyncio.sleep(HEALTH_INTERVAL_S)
 
@@ -631,7 +1042,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pipeline Gateway",
     description="Always-on proxy with offline queue for the PDF inference pipeline",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -655,7 +1066,72 @@ async def gateway_health():
         "trust_fastapi_chandra_health": TRUST_FASTAPI_CHANDRA_HEALTH,
         "upstream": status,
         "queue_db": str(QUEUE_DB),
+        "job_storage": _storage_backend(),
+        "s3_bucket": S3_BUCKET or None,
     }
+
+
+@app.get("/jobs")
+async def list_analysis_jobs():
+    rows = _list_analysis_jobs()
+    return {"jobs": [dict(r) for r in rows]}
+
+
+@app.get("/jobs/{job_id}")
+async def get_analysis_job(job_id: str):
+    row = _get_analysis_job(job_id)
+    if row is None:
+        return JSONResponse({"error": "job_not_found", "job_id": job_id}, status_code=404)
+    return _job_public_dict(row)
+
+
+@app.post("/analyze")
+async def analyze_gateway(
+    file: UploadFile = File(..., description="PDF file to analyze"),
+    question: str = Form(..., description="Question to ask about the document"),
+    callback_url: str | None = Form(
+        None, description="Optional URL to POST the result when processing completes"
+    ),
+    user_id: str | None = Form(None, description="Optional client user identifier"),
+):
+    """Proxy /analyze when online; queue PDF + question when the pipeline is offline."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        return JSONResponse({"error": "file_must_be_pdf"}, status_code=400)
+
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        return JSONResponse({"error": "empty_file"}, status_code=400)
+
+    filename = file.filename or "document.pdf"
+
+    async with _upstream_lock:
+        pipeline_ready = bool(_upstream.get("pipeline_ready"))
+
+    if pipeline_ready:
+        return await _forward_analyze(pdf_bytes, filename, question)
+
+    try:
+        job_id = _create_analysis_job(
+            pdf_bytes=pdf_bytes,
+            filename=filename,
+            question=question,
+            callback_url=callback_url,
+            user_id=user_id,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=413)
+
+    return JSONResponse(
+        {
+            "status": "queued",
+            "job_id": job_id,
+            "message": OFFLINE_MESSAGE,
+            "poll_url": f"/jobs/{job_id}",
+            "retry_after_seconds": int(HEALTH_INTERVAL_S),
+        },
+        status_code=202,
+        headers={"Retry-After": str(int(HEALTH_INTERVAL_S))},
+    )
 
 
 @app.get("/queue")
@@ -675,8 +1151,10 @@ async def list_queue():
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def gateway_proxy(request: Request, path: str):
-    if path in {"health", "queue", "docs", "openapi.json", "redoc"}:
+    if path in {"health", "queue", "jobs", "analyze", "docs", "openapi.json", "redoc"}:
         return JSONResponse({"error": "Use top-level gateway routes only."}, status_code=404)
+    if path.startswith("jobs/"):
+        return JSONResponse({"error": "Use GET /jobs/{job_id}."}, status_code=404)
 
     async with _upstream_lock:
         upstream_snapshot = _upstream.copy()
