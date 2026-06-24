@@ -9,11 +9,14 @@ FastAPI server that:
 5. Rewrites selected text via POST /rephrase (style + language)
 6. Streams general chat via POST /prompt
 7. Extracts structured fields from eGK + Personalausweis via POST /extract-id (4 uploads)
-8. Logs structured performance metrics to metrics.jsonl
+8. OCR-only text extraction via POST /extract (Chandra /v1/chat/completions per page)
+9. Document type classification via POST /classify (rules + LLM fallback)
+10. Logs structured performance metrics to metrics.jsonl
 """
 
 import asyncio
 import base64
+import binascii
 import copy
 import hashlib
 import html as html_lib
@@ -30,7 +33,7 @@ from html.parser import HTMLParser
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator, Literal
+from typing import Any, AsyncGenerator, Literal
 
 import fitz  # PyMuPDF — used only for PDF → PNG rendering
 import httpx
@@ -108,6 +111,21 @@ EXTRACT_ID_MAX_TOKENS = int(os.getenv("EXTRACT_ID_MAX_TOKENS", "2048"))
 EXTRACT_ID_TEMPERATURE = float(os.getenv("EXTRACT_ID_TEMPERATURE", "0.0"))
 EXTRACT_ID_TIMEOUT_S = float(os.getenv("EXTRACT_ID_TIMEOUT_S", "60"))
 EXTRACT_ID_OCR_TIMEOUT_S = float(os.getenv("EXTRACT_ID_OCR_TIMEOUT_S", "120"))
+
+# Document classification (/classify)
+CLASSIFY_MAX_TOKENS = int(os.getenv("CLASSIFY_MAX_TOKENS", "256"))
+CLASSIFY_TEMPERATURE = float(os.getenv("CLASSIFY_TEMPERATURE", "0.0"))
+CLASSIFY_TIMEOUT_S = float(os.getenv("CLASSIFY_TIMEOUT_S", "30"))
+CLASSIFY_TEXT_SNIPPET_CHARS = int(os.getenv("CLASSIFY_TEXT_SNIPPET_CHARS", "8000"))
+CLASSIFY_DOCUMENT_TYPES: tuple[str, ...] = tuple(
+    t.strip()
+    for t in os.getenv(
+        "CLASSIFY_DOCUMENT_TYPES",
+        "angebot,rechnung,auftrag,lieferschein,vertrag,bescheid,brief,"
+        "krankenversicherung,personalausweis,sonstiges",
+    ).split(",")
+    if t.strip()
+)
 
 RephraseStyle = Literal[
     "formal",
@@ -536,6 +554,254 @@ async def extract_text_with_chandra_api(
     }
 
     return document_text, "chandra_api", page_count, elapsed, classification
+
+
+# ---------------------------------------------------------------------------
+# Document type classification (rules + LLM)
+# ---------------------------------------------------------------------------
+
+# (document_type, regex patterns, weight per match, human-readable label)
+_DOCUMENT_TYPE_RULES: tuple[tuple[str, tuple[str, ...], float, str], ...] = (
+    (
+        "rechnung",
+        (
+            r"\brechnung\b",
+            r"\brechnungsnummer\b",
+            r"\brechnungsdatum\b",
+            r"\bzahlbar\b",
+            r"\bgesamtbetrag\b",
+            r"\bnettobetrag\b",
+        ),
+        2.0,
+        "invoice keywords",
+    ),
+    (
+        "angebot",
+        (
+            r"\bangebot\b",
+            r"\bangebotsnummer\b",
+            r"\bangebotszeitraum\b",
+            r"\bangebot\s*nr",
+        ),
+        2.0,
+        "offer keywords",
+    ),
+    (
+        "auftrag",
+        (
+            r"\bauftrag\b",
+            r"\bauftragsnummer\b",
+            r"\bbestellung\b",
+            r"\bbestellnummer\b",
+        ),
+        2.0,
+        "order keywords",
+    ),
+    (
+        "lieferschein",
+        (
+            r"\blieferschein\b",
+            r"\blieferung\b",
+            r"\blieferdatum\b",
+            r"\bversand\b",
+        ),
+        2.0,
+        "delivery note keywords",
+    ),
+    (
+        "vertrag",
+        (
+            r"\bvertrag\b",
+            r"\bvertragsnummer\b",
+            r"\bvereinbarung\b",
+        ),
+        2.0,
+        "contract keywords",
+    ),
+    (
+        "bescheid",
+        (
+            r"\bbescheid\b",
+            r"\bentscheidung\b",
+            r"\bbescheidnummer\b",
+        ),
+        2.0,
+        "official notice keywords",
+    ),
+    (
+        "krankenversicherung",
+        (
+            r"\bkrankenversichertennummer\b",
+            r"\bkrankenkasse\b",
+            r"\bversichertennummer\b",
+            r"\bkvnr\b",
+            r"\belektronische\s+gesundheitskarte\b",
+            r"\begk\b",
+        ),
+        2.0,
+        "health insurance keywords",
+    ),
+    (
+        "personalausweis",
+        (
+            r"\bpersonalausweis\b",
+            r"\bausweisnummer\b",
+            r"\baufenthaltstitel\b",
+            r"\breisepass\b",
+        ),
+        2.0,
+        "identity document keywords",
+    ),
+    (
+        "brief",
+        (
+            r"\bsehr\s+geehrte\b",
+            r"\bmit\s+freundlichen\s+grüßen\b",
+            r"\banschreiben\b",
+        ),
+        1.0,
+        "letter keywords",
+    ),
+)
+
+_CLASSIFY_JSON_SCHEMA = (
+    '{"document_type": "angebot", "confidence": 0.85, "reason": "short explanation"}'
+)
+
+
+def classify_document_type_rules(document_text: str) -> dict[str, Any]:
+    """Keyword/rule-based document classification fallback."""
+    text = document_text.lower()
+    best_type = "sonstiges"
+    best_score = 0.0
+    best_reason = "No strong keyword signals; defaulting to sonstiges."
+
+    for doc_type, patterns, weight, label in _DOCUMENT_TYPE_RULES:
+        if doc_type not in CLASSIFY_DOCUMENT_TYPES:
+            continue
+        type_score = 0.0
+        matched: list[str] = []
+        for pattern in patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                type_score += weight
+                matched.append(pattern)
+        if type_score > best_score:
+            best_score = type_score
+            best_type = doc_type
+            best_reason = f"Matched {label}: {', '.join(matched)}"
+
+    if best_score == 0.0:
+        return {
+            "document_type": "sonstiges",
+            "confidence": 0.35,
+            "reason": best_reason,
+        }
+
+    confidence = min(0.95, 0.45 + best_score * 0.12)
+    return {
+        "document_type": best_type,
+        "confidence": round(confidence, 2),
+        "reason": best_reason,
+    }
+
+
+def build_classify_prompt(document_text: str) -> list[dict]:
+    types_list = ", ".join(CLASSIFY_DOCUMENT_TYPES)
+    snippet = document_text[:CLASSIFY_TEXT_SNIPPET_CHARS]
+    system_prompt = (
+        "You classify German business and personal documents from OCR text.\n"
+        f"Choose exactly one document_type from: {types_list}.\n"
+        "Use sonstiges when no type fits confidently.\n"
+        "Output JSON only — no markdown, no explanation outside JSON.\n"
+        "confidence must be between 0 and 1.\n"
+        "reason: one short sentence citing visible cues from the text."
+    )
+    user_content = (
+        f"OCR document text:\n\n{snippet}\n\n"
+        f"Return JSON matching this schema:\n{_CLASSIFY_JSON_SCHEMA}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+async def classify_document_type_with_llm(document_text: str) -> dict[str, Any] | None:
+    """LLM document classification; returns None on failure."""
+    try:
+        raw = await call_llm_completion(
+            build_classify_prompt(document_text),
+            max_tokens=CLASSIFY_MAX_TOKENS,
+            temperature=CLASSIFY_TEMPERATURE,
+            timeout=CLASSIFY_TIMEOUT_S,
+            json_mode=True,
+        )
+        data = parse_llm_json(raw)
+        doc_type = str(data.get("document_type", "")).strip().lower()
+        if doc_type not in CLASSIFY_DOCUMENT_TYPES:
+            doc_type = "sonstiges"
+        confidence = float(data.get("confidence", 0.7))
+        confidence = max(0.0, min(1.0, confidence))
+        reason = str(data.get("reason", "")).strip() or "LLM classification"
+        return {
+            "document_type": doc_type,
+            "confidence": round(confidence, 2),
+            "reason": reason,
+        }
+    except Exception:
+        logger.warning("LLM document classification failed; using rules fallback")
+        return None
+
+
+async def classify_document_text(document_text: str) -> dict[str, Any]:
+    """Try LLM classification first, then rules-based fallback."""
+    llm_result = await classify_document_type_with_llm(document_text)
+    if llm_result:
+        return {**llm_result, "classification_method": "llm"}
+    rules_result = classify_document_type_rules(document_text)
+    return {**rules_result, "classification_method": "rules"}
+
+
+async def _extract_pdf_text_cached(
+    pdf_bytes: bytes,
+    filename: str,
+    request_id: str,
+) -> tuple[str, str, int, float, bool]:
+    """
+    Extract PDF text via Chandra with LRU/disk cache.
+    Returns (document_text, extraction_method, page_count, extraction_time_s, cached).
+    """
+    pdf_key = _pdf_hash(pdf_bytes)
+    cached = _cache_get(pdf_key)
+    if cached is not None:
+        logger.info("[req=%s] PDF cache hit %s…", request_id, pdf_key[:12])
+        return (
+            cached["document_text"],
+            cached["extraction_method"],
+            cached["page_count"],
+            0.0,
+            True,
+        )
+
+    (
+        document_text,
+        extraction_method,
+        page_count,
+        extraction_time_s,
+        pdf_classification,
+    ) = await extract_text_with_chandra_api(pdf_bytes, filename)
+
+    _cache_put(
+        pdf_key,
+        {
+            "document_text": document_text,
+            "extraction_method": extraction_method,
+            "page_count": page_count,
+            "extraction_time_s": extraction_time_s,
+            "pdf_classification": copy.deepcopy(pdf_classification),
+        },
+    )
+    return document_text, extraction_method, page_count, extraction_time_s, False
 
 
 _ALLOWED_ID_MIME: dict[str, str] = {
@@ -1146,6 +1412,34 @@ class IdCardExtractionResponse(BaseModel):
     llm_time_s: float
 
 
+class ExtractResponse(BaseModel):
+    filename: str
+    document_text: str
+    extraction_method: str
+    page_count: int
+    extraction_time_s: float
+
+
+class ClassifyResponse(BaseModel):
+    filename: str
+    document_type: str
+    confidence: float
+    reason: str
+    classification_method: Literal["llm", "rules"]
+    extraction_cached: bool | None = None
+    extraction_time_s: float | None = None
+
+
+class ClassifyTextBody(BaseModel):
+    documentText: str = Field(..., min_length=20)
+    fileName: str | None = None
+
+
+class ClassifyPdfJsonBody(BaseModel):
+    fileBase64: str = Field(..., min_length=10)
+    fileName: str = Field(..., min_length=1)
+
+
 class ChatHistoryMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1)
@@ -1641,6 +1935,310 @@ async def extract_id_documents(
         extraction_time_s=elapsed,
         ocr_time_s=ocr_time_s,
         llm_time_s=llm_time_s,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Extract endpoint (OCR only — no LLM)
+# ---------------------------------------------------------------------------
+
+@app.post("/extract", response_model=ExtractResponse)
+async def extract_pdf(
+    request: Request,
+    file: UploadFile = File(..., description="PDF file to extract text from"),
+):
+    """
+    OCR-only: extract text from a PDF via Chandra (/v1/chat/completions per page).
+    Returns filename and document_text without running the reasoning model.
+    """
+    request_id: str = getattr(request.state, "request_id", str(uuid.uuid4())[:8])
+    t_request_start = time.perf_counter()
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+    filename = file.filename or "document.pdf"
+
+    try:
+        (
+            document_text,
+            extraction_method,
+            page_count,
+            extraction_time_s,
+            _cached,
+        ) = await _extract_pdf_text_cached(pdf_bytes, filename, request_id)
+    except Exception as exc:
+        logger.exception("[req=%s] /extract failed", request_id)
+        raise HTTPException(
+            status_code=400, detail=f"Failed to extract PDF text: {exc}"
+        ) from exc
+
+    if not document_text.strip():
+        raise HTTPException(
+            status_code=400, detail="No text could be extracted from the PDF"
+        )
+
+    elapsed = round(time.perf_counter() - t_request_start, 4)
+    logger.info(
+        "[req=%s] POST /extract pages=%d ocr=%.3fs total=%.3fs",
+        request_id,
+        page_count,
+        extraction_time_s,
+        elapsed,
+    )
+
+    return ExtractResponse(
+        filename=filename,
+        document_text=document_text,
+        extraction_method=extraction_method,
+        page_count=page_count,
+        extraction_time_s=extraction_time_s,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Classify endpoint (OCR + document type)
+# ---------------------------------------------------------------------------
+
+async def _classify_pdf_bytes(
+    pdf_bytes: bytes,
+    filename: str,
+    request_id: str,
+) -> ClassifyResponse:
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+    try:
+        (
+            document_text,
+            _extraction_method,
+            _page_count,
+            extraction_time_s,
+            extraction_cached,
+        ) = await _extract_pdf_text_cached(pdf_bytes, filename, request_id)
+    except Exception as exc:
+        logger.exception("[req=%s] /classify OCR failed", request_id)
+        raise HTTPException(
+            status_code=400, detail=f"Failed to extract PDF text: {exc}"
+        ) from exc
+
+    if not document_text.strip():
+        raise HTTPException(
+            status_code=400, detail="No text could be extracted from the PDF"
+        )
+
+    classification = await classify_document_text(document_text)
+    return ClassifyResponse(
+        filename=filename,
+        document_type=classification["document_type"],
+        confidence=classification["confidence"],
+        reason=classification["reason"],
+        classification_method=classification["classification_method"],
+        extraction_cached=extraction_cached,
+        extraction_time_s=extraction_time_s,
+    )
+
+
+async def _classify_from_upload_file(
+    upload: UploadFile,
+    request_id: str,
+    t_start: float,
+    log_label: str,
+) -> ClassifyResponse:
+    pdf_bytes = await upload.read()
+    filename = upload.filename or "document.pdf"
+    result = await _classify_pdf_bytes(pdf_bytes, filename, request_id)
+    elapsed = round(time.perf_counter() - t_start, 4)
+    logger.info(
+        "[req=%s] POST /classify %s type=%s method=%s ocr=%.3fs total=%.3fs",
+        request_id,
+        log_label,
+        result.document_type,
+        result.classification_method,
+        result.extraction_time_s or 0.0,
+        elapsed,
+    )
+    return result
+
+
+async def _classify_from_json_body(
+    body: Any,
+    request_id: str,
+    t_start: float,
+) -> ClassifyResponse:
+    try:
+        text_body = ClassifyTextBody.model_validate(body)
+        classification = await classify_document_text(text_body.documentText)
+        elapsed = round(time.perf_counter() - t_start, 4)
+        logger.info(
+            "[req=%s] POST /classify text-only type=%s method=%s total=%.3fs",
+            request_id,
+            classification["document_type"],
+            classification["classification_method"],
+            elapsed,
+        )
+        return ClassifyResponse(
+            filename=text_body.fileName or "document.txt",
+            document_type=classification["document_type"],
+            confidence=classification["confidence"],
+            reason=classification["reason"],
+            classification_method=classification["classification_method"],
+        )
+    except ValidationError:
+        try:
+            pdf_body = ClassifyPdfJsonBody.model_validate(body)
+        except ValidationError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid request body: provide documentText or "
+                    "fileBase64 + fileName"
+                ),
+            ) from None
+
+        try:
+            pdf_bytes = base64.b64decode(pdf_body.fileBase64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail="fileBase64 is not valid base64"
+            ) from exc
+
+        result = await _classify_pdf_bytes(pdf_bytes, pdf_body.fileName, request_id)
+        elapsed = round(time.perf_counter() - t_start, 4)
+        logger.info(
+            "[req=%s] POST /classify pdf-json type=%s method=%s ocr=%.3fs total=%.3fs",
+            request_id,
+            result.document_type,
+            result.classification_method,
+            result.extraction_time_s or 0.0,
+            elapsed,
+        )
+        return result
+
+
+def _multipart_field_summary(form: Any) -> str:
+    """Describe parsed multipart fields for debugging proxy/upload issues."""
+    parts: list[str] = []
+    try:
+        items = list(form.multi_items())
+    except Exception:
+        return "unable to list form fields"
+
+    for key, value in items:
+        if isinstance(value, UploadFile):
+            parts.append(
+                f"{key}=UploadFile(filename={value.filename!r}, "
+                f"content_type={value.content_type!r})"
+            )
+        else:
+            preview = str(value)
+            if len(preview) > 80:
+                preview = preview[:80] + "…"
+            parts.append(f"{key}=text({preview!r})")
+    return ", ".join(parts) if parts else "no fields"
+
+
+def _pick_multipart_file(form: Any) -> UploadFile | None:
+    """Return the best file upload from a parsed multipart form."""
+    preferred = form.get("file")
+    if isinstance(preferred, UploadFile):
+        return preferred
+
+    for key, value in form.multi_items():
+        if isinstance(value, UploadFile):
+            return value
+    return None
+
+
+@app.post("/classify", response_model=ClassifyResponse)
+async def classify_document(
+    request: Request,
+    file: UploadFile | None = File(
+        None, description="PDF file (multipart form-data, field name file)"
+    ),
+):
+    """
+    Classify a document type from OCR text or a PDF upload.
+
+    Accepts:
+      - JSON: { documentText, fileName? } — classify pre-extracted text
+      - JSON: { fileBase64, fileName } — OCR PDF then classify
+      - multipart/form-data: file field with a PDF
+    """
+    request_id: str = getattr(request.state, "request_id", str(uuid.uuid4())[:8])
+    t_start = time.perf_counter()
+    content_type = (request.headers.get("content-type") or "").lower()
+    content_length = request.headers.get("content-length")
+    body_length = int(content_length) if content_length and content_length.isdigit() else None
+
+    if "multipart" in content_type and body_length == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Empty multipart body. Re-attach the PDF in form-data "
+                "(field name must be file)."
+            ),
+        )
+
+    if "application/json" in content_type:
+        body: Any = await request.json()
+        return await _classify_from_json_body(body, request_id, t_start)
+
+    if file is not None:
+        return await _classify_from_upload_file(
+            file, request_id, t_start, "multipart-file"
+        )
+
+    if "multipart" in content_type:
+        form = await request.form()
+        upload = _pick_multipart_file(form)
+        if upload is not None:
+            return await _classify_from_upload_file(
+                upload, request_id, t_start, "multipart-form"
+            )
+        summary = _multipart_field_summary(form)
+        logger.warning(
+            "[req=%s] classify multipart missing file upload; fields=%s",
+            request_id,
+            summary,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "file field is required in multipart form-data. "
+                f"Received: {summary}. "
+                "In Postman use form-data key 'file', type File, and re-select the PDF."
+            ),
+        )
+
+    # Proxies may strip Content-Type; try multipart parse when header is missing.
+    if not content_type.strip():
+        try:
+            form = await request.form()
+            upload = _pick_multipart_file(form)
+            if upload is not None:
+                return await _classify_from_upload_file(
+                    upload, request_id, t_start, "multipart-fallback"
+                )
+        except Exception:
+            logger.debug(
+                "[req=%s] classify multipart fallback parse failed", request_id
+            )
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Unsupported content type ({content_type!r}, "
+            f"content-length={content_length!r}). "
+            "Use application/json (documentText or fileBase64+fileName) "
+            "or multipart/form-data with field name file and a PDF attached."
+        ),
     )
 
 

@@ -85,10 +85,12 @@ CHANDRA_OFFLINE_MESSAGE = os.getenv(
     "and will run automatically when the service is back.",
 )
 
-# First URL path segment → route to CHANDRA_URL instead of FASTAPI_URL
+# Optional: first path segments proxied directly to CHANDRA_URL (not FastAPI).
+# Chandra is a vLLM server (/v1/chat/completions only) — app routes like /extract
+# must go to FastAPI, which calls Chandra internally. Default: none.
 CHANDRA_PROXY_PATHS: frozenset[str] = frozenset(
     part.strip().strip("/")
-    for part in os.getenv("CHANDRA_PROXY_PATHS", "classify,extract").split(",")
+    for part in os.getenv("CHANDRA_PROXY_PATHS", "").split(",")
     if part.strip()
 )
 
@@ -184,7 +186,6 @@ def _effective_chandra_reachable(
 def _service_ready(path: str, upstream: dict[str, Any]) -> bool:
     """Check whether the target upstream for this path is ready."""
     if _is_chandra_path(path):
-        # /classify and /extract are proxied directly to CHANDRA_URL.
         return bool(upstream.get("chandra_direct_reachable"))
     return bool(upstream.get("pipeline_ready"))
 
@@ -399,8 +400,8 @@ async def _refresh_upstream_status() -> None:
         elif not chandra_direct_ok and chandra_ok:
             logger.info(
                 "Chandra not directly reachable from gateway; using FastAPI /health "
-                "report (chandra_ocr=healthy). Direct /classify /extract still need "
-                "network access to CHANDRA_URL."
+                "report (chandra_ocr=healthy). CHANDRA_PROXY_PATHS traffic still needs "
+                "direct network access to CHANDRA_URL."
             )
 
         _upstream.update(

@@ -172,7 +172,8 @@ def build_multipart_body(
             files=files,
             data=form_data,
         )
-        return req.content, dict(req.headers)
+        content = req.read()
+        return content, dict(req.headers)
 
 
 def create_job(
