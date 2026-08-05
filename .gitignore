@@ -1,0 +1,19 @@
+# Environment
+.env.local
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Runtime artifacts
+metrics.jsonl
+pdf_cache/
+sglang.log
+*.log
+
+# macOS
+.DS_Store
+x
